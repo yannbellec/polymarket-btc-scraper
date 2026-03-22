@@ -11,7 +11,7 @@ import httpx
 from config.settings import CLOB_API_URL, TICK_INTERVAL_SEC
 from monitoring.logger import log
 from storage.writer import push, next_tick_id
-from scraper.ws_binance import get_btc_spot
+from scraper.ws_rtds import get_btc_spot
 from scraper.discoverer import get_active_markets
 
 # ── Historique de prix par marché pour les deltas ─────────────────────────────
@@ -152,7 +152,7 @@ async def _snapshot_market(client: httpx.AsyncClient, market) -> None:
         "volume_since_open":      _volume_cumul.get(mid, 0.0),
         "trade_count_since_open": _trade_count.get(mid, 0),
         "btc_spot":               btc_spot,
-        "moneyness":              btc_spot - market.strike_price,
+        "moneyness": btc_spot - market.btc_spot_at_open if market.btc_spot_at_open else 0.0,
     }
 
     await push("orderbook_ticks", row)

@@ -22,8 +22,7 @@ def init_schema(con: duckdb.DuckDBPyConnection) -> None:
 
             -- Caractéristiques du contrat
             question                TEXT,
-            strike_price            DOUBLE,
-            outcome_above           BOOLEAN,
+            window_ts               BIGINT,
             expiry_ts_ms            BIGINT,
             expiry_iso              TEXT,
             window_minutes          INTEGER,
@@ -41,6 +40,7 @@ def init_schema(con: duckdb.DuckDBPyConnection) -> None:
 
             -- Dérivés calculés à la découverte
             btc_spot_at_open        DOUBLE,
+            price_to_beat           DOUBLE,
             moneyness_at_open       DOUBLE,
             moneyness_pct_at_open   DOUBLE,
             seconds_to_expiry_at_open INTEGER,

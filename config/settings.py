@@ -18,7 +18,7 @@ R2_BUCKET_NAME        = os.getenv("R2_BUCKET_NAME", "polymarket-btc-data")
 R2_ENDPOINT_URL       = os.getenv("R2_ENDPOINT_URL", f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com")
 
 # ── Timing ────────────────────────────────────────────────────────────────────
-DISCOVER_INTERVAL_SEC = int(os.getenv("DISCOVER_INTERVAL_SEC", "15"))
+DISCOVER_INTERVAL_SEC = int(os.getenv("DISCOVER_INTERVAL_SEC", "5"))
 TICK_INTERVAL_SEC     = int(os.getenv("TICK_INTERVAL_SEC",     "1"))
 FLUSH_INTERVAL_SEC    = int(os.getenv("FLUSH_INTERVAL_SEC",    "60"))
 UPLOAD_INTERVAL_SEC   = int(os.getenv("UPLOAD_INTERVAL_SEC",   "300"))

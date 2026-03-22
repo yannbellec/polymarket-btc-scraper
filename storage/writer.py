@@ -73,11 +73,37 @@ async def flush_all() -> int:
 
 
 def _insert_rows(con: duckdb.DuckDBPyConnection, table: str, rows: list[dict]) -> None:
-    """Insert batch via duckdb (rapide, évite les INSERT 1 par 1)."""
     import pandas as pd
+
     df = pd.DataFrame(rows)
-    # DuckDB peut insérer depuis un DataFrame directement
-    con.execute(f"INSERT OR REPLACE INTO {table} SELECT * FROM df")
+
+    # Réordonne les colonnes selon le schéma DuckDB
+    schema_cols = [col[0] for col in con.execute(
+        f"SELECT column_name FROM information_schema.columns "
+        f"WHERE table_name='{table}' ORDER BY ordinal_position"
+    ).fetchall()]
+
+    # Garde seulement les colonnes présentes dans les deux
+    cols = [c for c in schema_cols if c in df.columns]
+    df = df[cols]
+
+    pk_tables = {"trades", "btc_markets", "btc_spot_ticks", "market_snapshots"}
+
+    if table in pk_tables:
+        try:
+            con.execute(f"INSERT OR IGNORE INTO {table} SELECT * FROM df")
+        except Exception:
+            inserted = 0
+            for _, row in df.iterrows():
+                try:
+                    row_df = pd.DataFrame([row])
+                    con.execute(f"INSERT OR IGNORE INTO {table} SELECT * FROM row_df")
+                    inserted += 1
+                except Exception:
+                    pass
+            log.debug(f"{table}: {inserted}/{len(df)} lignes (doublons ignorés)")
+    else:
+        con.execute(f"INSERT INTO {table} SELECT * FROM df")
 
 
 async def export_parquet(date_str: str | None = None) -> list[str]:

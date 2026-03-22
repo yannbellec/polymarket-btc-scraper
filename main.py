@@ -3,29 +3,28 @@ Point d'entrée principal — BTC Polymarket Scraper.
 Process indépendant du bot météo.
 
 Architecture :
-  binance_ws_loop()     → prix BTC spot en temps réel
+  rtds_loop()           → prix BTC spot en temps réel (Binance + Chainlink via Polymarket)
   discovery_loop()      → détecte les marchés BTC 5-min actifs
   polymarket_ws_loop()  → events trades et prix en temps réel
-  book_poll_loop()      → snapshot order book complet toutes les 1s
   flush_loop()          → buffer mémoire → DuckDB toutes les 60s
   upload_loop()         → DuckDB → Parquet → R2 toutes les 5 min
+  expiry_watcher_loop() → déclenche les snapshots à l'expiry
+  status_loop()         → log du statut toutes les 60s
 """
 import asyncio
 import sys
+import time
 
 from monitoring.logger import log
 from monitoring.telegram_alert import alert_start, alert_stop, alert_error
-from config.settings import FLUSH_INTERVAL_SEC, UPLOAD_INTERVAL_SEC
 
-from scraper.ws_binance import binance_ws_loop, get_btc_spot
+from scraper.ws_rtds import binance_ws_loop, get_btc_spot
 from scraper.ws_polymarket import polymarket_ws_loop, register_market, subscribe_tokens
-from scraper.discoverer import discovery_loop, register_on_new_market
-from scraper.book_poller import book_poll_loop
+from scraper.discoverer import discovery_loop, register_on_new_market, get_active_markets
+from scraper.snapshot_builder import build_snapshot
 from storage.writer import flush_loop, flush_all, get_buffer_stats
 from storage.r2_uploader import upload_loop
 
-
-# ── Callback : nouveau marché découvert ───────────────────────────────────────
 
 async def on_new_market(market) -> None:
     """Appelé par le discoverer quand un nouveau marché BTC est trouvé."""
@@ -34,7 +33,20 @@ async def on_new_market(market) -> None:
     log.info(f"Marché enregistré pour WS: {market.question[:60]}")
 
 
-# ── Boucle de monitoring console ─────────────────────────────────────────────
+async def expiry_watcher_loop() -> None:
+    """Surveille les expiries et déclenche les snapshots."""
+    triggered = set()
+    while True:
+        await asyncio.sleep(5)
+        now_ms = int(time.time() * 1000)
+        for market_id, market in list(get_active_markets().items()):
+            if 0 < now_ms - market.expiry_ts_ms < 15_000 and market_id not in triggered:
+                triggered.add(market_id)
+                log.info(f"Expiry détectée: {market.question[:50]}")
+                await asyncio.sleep(5)
+                await flush_all()
+                await build_snapshot(market_id, market_obj=market, winning_outcome=None)
+
 
 async def status_loop() -> None:
     """Log le statut toutes les 60s pour monitoring Railway."""
@@ -42,12 +54,8 @@ async def status_loop() -> None:
         await asyncio.sleep(60)
         stats = get_buffer_stats()
         total_pending = sum(stats.values())
-        log.info(
-            f"Status — buffers: {stats} | total pending: {total_pending}"
-        )
+        log.info(f"Status — buffers: {stats} | total pending: {total_pending}")
 
-
-# ── Main ──────────────────────────────────────────────────────────────────────
 
 async def run() -> None:
     log.info("=" * 56)
@@ -55,29 +63,23 @@ async def run() -> None:
     log.info("=" * 56)
 
     alert_start()
-
-    # Enregistre le callback de découverte
     register_on_new_market(on_new_market)
 
-    # Lance toutes les coroutines en parallèle
     tasks = [
-        asyncio.create_task(binance_ws_loop(),    name="binance_ws"),
-        asyncio.create_task(polymarket_ws_loop(), name="polymarket_ws"),
-        asyncio.create_task(discovery_loop(get_btc_spot), name="discoverer"),
-        asyncio.create_task(book_poll_loop(),     name="book_poller"),
-        asyncio.create_task(flush_loop(),         name="writer_flush"),
-        asyncio.create_task(upload_loop(),        name="r2_upload"),
-        asyncio.create_task(status_loop(),        name="status"),
+        asyncio.create_task(binance_ws_loop(),             name="rtds"),
+        asyncio.create_task(polymarket_ws_loop(),          name="polymarket_ws"),
+        asyncio.create_task(discovery_loop(get_btc_spot),  name="discoverer"),
+        asyncio.create_task(flush_loop(),                  name="writer_flush"),
+        asyncio.create_task(upload_loop(),                 name="r2_upload"),
+        asyncio.create_task(expiry_watcher_loop(),         name="expiry_watcher"),
+        asyncio.create_task(status_loop(),                 name="status"),
     ]
 
     log.info(f"  {len(tasks)} coroutines démarrées")
     log.info("=" * 56)
 
     try:
-        # Attend que toutes les tâches tournent (loop infinie)
-        # Si une tâche crash, on la voit et on log
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
-
         for task in done:
             exc = task.exception()
             if exc:
@@ -92,12 +94,10 @@ async def run() -> None:
         alert_error(str(e))
 
     finally:
-        # Flush final avant arrêt
         log.info("Flush final avant arrêt...")
         n = await flush_all()
         log.info(f"Flush final: {n} lignes écrites")
         alert_stop("Arrêt propre")
-
         for task in tasks:
             task.cancel()
 
