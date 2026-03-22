@@ -5,12 +5,14 @@ slug = btc-updown-5m-{window_ts} où window_ts = now - (now % 300)
 import asyncio
 import time
 from dataclasses import dataclass
+from typing import Any, Dict, Optional
 
 import httpx
 
 from config.settings import GAMMA_API_URL, DISCOVER_INTERVAL_SEC
 from monitoring.logger import log
 from storage.writer import push
+from scraper.inter_market_context import get_context_for_window
 
 
 @dataclass
@@ -28,11 +30,15 @@ class BtcMarket:
     initial_price_yes: float
     initial_price_no:  float
     btc_spot_at_open:  float = 0.0
+    inter_context:     Optional[Dict[str, Any]] = None
 
 
 _active_markets:       dict[str, BtcMarket] = {}
 _window_to_market:     dict[int, str]        = {}
 _on_new_market_callbacks: list               = []
+
+# Marchés déjà passés dans expiry_watcher (snapshot) — vidé à la purge pour éviter croissance infinie
+expiry_snapshot_triggered: set[str] = set()
 
 MARKET_PATTERNS = [("btc-updown-5m", 300)]
 
@@ -135,6 +141,8 @@ async def _try_discover_slug(client, slug: str, window_ts: int,
     expiry_ts_ms = (window_ts + window_sec) * 1000
     open_ts_ms   = window_ts * 1000
 
+    inter_ctx = get_context_for_window(window_ts)
+
     market = BtcMarket(
         market_id=market_id,
         condition_id=condition_id,
@@ -149,6 +157,7 @@ async def _try_discover_slug(client, slug: str, window_ts: int,
         initial_price_yes=price_yes,
         initial_price_no=price_no,
         btc_spot_at_open=btc_open,
+        inter_context=inter_ctx,
     )
 
     _active_markets[market_id]    = market
@@ -182,6 +191,7 @@ async def _try_discover_slug(client, slug: str, window_ts: int,
         "winning_outcome":            None,
         "final_btc_price":            None,
         "closed_ts_ms":               None,
+        **inter_ctx,
     })
 
     log.info(
@@ -199,7 +209,7 @@ async def _try_discover_slug(client, slug: str, window_ts: int,
 
 
 async def discovery_loop(btc_spot_fn) -> None:
-    log.info("Discoverer démarré (multi-pattern, poll toutes les 15s)")
+    log.info(f"Discoverer démarré (multi-pattern, poll toutes les {DISCOVER_INTERVAL_SEC}s)")
     async with httpx.AsyncClient() as client:
         while True:
             try:
@@ -215,11 +225,13 @@ async def discovery_loop(btc_spot_fn) -> None:
                     if (nwts - now) <= 30:
                         await _try_discover_slug(client, f"{prefix}-{nwts}", nwts, window_sec, btc_spot_fn)
 
+                # 60s après expiry : laisse le temps à expiry_watcher + snapshot avant retrait mémoire
                 expired = [mid for mid, m in _active_markets.items()
-                           if m.expiry_ts_ms < now_ms - 10_000]
+                           if m.expiry_ts_ms < now_ms - 60_000]
                 for mid in expired:
                     log.info(f"Expiré purgé: {_active_markets[mid].question[:50]}")
                     del _active_markets[mid]
+                expiry_snapshot_triggered.difference_update(expired)
 
             except Exception as e:
                 log.error(f"Discovery error: {e}")

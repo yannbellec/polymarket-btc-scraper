@@ -13,6 +13,7 @@ from monitoring.logger import log
 from storage.writer import push, next_tick_id
 from scraper.ws_rtds import get_btc_spot
 from scraper.discoverer import get_active_markets
+from scraper.ws_polymarket import get_btc_horizon_fields, get_inter_market_fields
 
 # ── Historique de prix par marché pour les deltas ─────────────────────────────
 # market_id → liste des 10 derniers mid YES
@@ -111,13 +112,16 @@ async def _snapshot_market(client: httpx.AsyncClient, market) -> None:
     total_liq = bid_liq + ask_liq
     imbalance = (bid_liq - ask_liq) / total_liq if total_liq > 0 else 0.0
 
-    # Deltas de prix
+    # Deltas de prix (poll ~1s : delta_tick = inter-poll ; delta_10s ≈ sur ~10 s)
     history = _price_history.setdefault(mid, [])
-    delta_1s  = yes_mid - history[-1]  if len(history) >= 1  else 0.0
-    delta_10s = yes_mid - history[-10] if len(history) >= 10 else 0.0
+    delta_tick = yes_mid - history[-1]  if len(history) >= 1  else 0.0
+    delta_10s  = yes_mid - history[-10] if len(history) >= 10 else 0.0
     history.append(yes_mid)
     if len(history) > 300:  # garde les 5 dernières minutes
         history.pop(0)
+
+    btc_hz = get_btc_horizon_fields(mid, now_ms)
+    im     = get_inter_market_fields(mid)
 
     row = {
         "tick_id":                next_tick_id(),
@@ -147,12 +151,14 @@ async def _snapshot_market(client: httpx.AsyncClient, market) -> None:
         "yes_spread":             yes_spread,
         "yes_spread_pct":         yes_spread_pct,
         "book_imbalance":         imbalance,
-        "yes_price_delta_1s":     delta_1s,
+        "yes_price_delta_tick":   delta_tick,
         "yes_price_delta_10s":    delta_10s,
         "volume_since_open":      _volume_cumul.get(mid, 0.0),
         "trade_count_since_open": _trade_count.get(mid, 0),
         "btc_spot":               btc_spot,
         "moneyness": btc_spot - market.btc_spot_at_open if market.btc_spot_at_open else 0.0,
+        **btc_hz,
+        **im,
     }
 
     await push("orderbook_ticks", row)

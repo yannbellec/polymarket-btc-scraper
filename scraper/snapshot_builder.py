@@ -11,6 +11,7 @@ from monitoring.logger import log
 from storage.writer import push
 from storage.schema import get_connection as _get_con
 from scraper.ws_rtds import get_btc_spot
+from scraper.inter_market_context import record_completion
 
 
 async def _fetch_winning_outcome(market_id: str, max_retries: int = 20) -> str | None:
@@ -84,6 +85,7 @@ async def build_snapshot(market_id: str, market_obj=None, winning_outcome: str |
         if market_obj:
             m = {
                 "market_id":         market_obj.market_id,
+                "window_ts":         market_obj.window_ts,
                 "expiry_ts_ms":      market_obj.expiry_ts_ms,
                 "open_ts_ms":        market_obj.open_ts_ms,
                 "btc_spot_at_open":  market_obj.btc_spot_at_open,
@@ -190,6 +192,15 @@ async def build_snapshot(market_id: str, market_obj=None, winning_outcome: str |
         }
 
         await push("market_snapshots", snap)
+        wts = m.get("window_ts")
+        if wts is not None:
+            record_completion(
+                int(wts),
+                market_id,
+                winning_outcome,
+                float(btc_move),
+                float(close_price),
+            )
         log.info(
             f"Snapshot créé: {market_id} | outcome={winning_outcome} | "
             f"ticks={total_ticks} | trades={total_trades_n} | "
