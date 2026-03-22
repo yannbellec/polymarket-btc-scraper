@@ -41,6 +41,7 @@ def init_schema(con: duckdb.DuckDBPyConnection) -> None:
             -- Dérivés calculés à la découverte
             btc_spot_at_open        DOUBLE,
             price_to_beat           DOUBLE,
+            price_to_beat           DOUBLE,
             moneyness_at_open       DOUBLE,
             moneyness_pct_at_open   DOUBLE,
             seconds_to_expiry_at_open INTEGER,
