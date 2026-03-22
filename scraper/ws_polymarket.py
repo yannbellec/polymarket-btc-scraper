@@ -16,7 +16,11 @@ import websockets
 from config.settings import POLYMARKET_WS_URL
 from monitoring.logger import log
 from storage.writer import push, next_tick_id
-from scraper.ws_rtds import get_btc_spot, chainlink_price_at_or_after
+from scraper.ws_rtds import (
+    get_btc_spot,
+    chainlink_price_at_or_after,
+    get_chainlink_realized_vol_fields,
+)
 from scraper.inter_market_context import empty_inter_market_fields
 
 _subscribed_tokens: set[str] = set()
@@ -63,6 +67,7 @@ def get_btc_horizon_fields(market_id: str, now_ms: int) -> Dict[str, Any]:
         "btc_delta_2min": None,
         "btc_delta_3min": None,
     }
+    out.update(get_chainlink_realized_vol_fields(now_ms, open_ts if open_ts else None))
     if not open_ts or p0 <= 0:
         return out
     st = _horizon_state(market_id)

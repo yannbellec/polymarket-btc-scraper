@@ -52,7 +52,12 @@ def init_schema(con: duckdb.DuckDBPyConnection) -> None:
             prev3_market_id         TEXT,
             prev3_outcome           TEXT,
             prev3_btc_move_pct      DOUBLE,
-            prev3_close_price_yes   DOUBLE
+            prev3_close_price_yes   DOUBLE,
+            prev_no_streak                  INTEGER,
+            prev_btc_down_streak            INTEGER,
+            prev_no_count                   INTEGER,
+            prev_btc_down_count             INTEGER,
+            prev_signal_all3_no_btc_down    DOUBLE
         )
     """)
 
@@ -91,6 +96,10 @@ def init_schema(con: duckdb.DuckDBPyConnection) -> None:
             btc_delta_1min          DOUBLE,
             btc_delta_2min          DOUBLE,
             btc_delta_3min          DOUBLE,
+            btc_vol_1m              DOUBLE,
+            btc_vol_2m              DOUBLE,
+            btc_vol_5m              DOUBLE,
+            btc_vol_since_open      DOUBLE,
             prev1_market_id         TEXT,
             prev1_outcome           TEXT,
             prev1_btc_move_pct      DOUBLE,
@@ -103,6 +112,11 @@ def init_schema(con: duckdb.DuckDBPyConnection) -> None:
             prev3_outcome           TEXT,
             prev3_btc_move_pct      DOUBLE,
             prev3_close_price_yes   DOUBLE,
+            prev_no_streak                  INTEGER,
+            prev_btc_down_streak            INTEGER,
+            prev_no_count                   INTEGER,
+            prev_btc_down_count             INTEGER,
+            prev_signal_all3_no_btc_down    DOUBLE,
             ofi_since_open          DOUBLE,
             ofi_last_60s            DOUBLE
         )
@@ -130,6 +144,10 @@ def init_schema(con: duckdb.DuckDBPyConnection) -> None:
             btc_delta_1min              DOUBLE,
             btc_delta_2min              DOUBLE,
             btc_delta_3min              DOUBLE,
+            btc_vol_1m                  DOUBLE,
+            btc_vol_2m                  DOUBLE,
+            btc_vol_5m                  DOUBLE,
+            btc_vol_since_open          DOUBLE,
             prev1_market_id             TEXT,
             prev1_outcome               TEXT,
             prev1_btc_move_pct          DOUBLE,
@@ -141,7 +159,12 @@ def init_schema(con: duckdb.DuckDBPyConnection) -> None:
             prev3_market_id             TEXT,
             prev3_outcome               TEXT,
             prev3_btc_move_pct          DOUBLE,
-            prev3_close_price_yes       DOUBLE
+            prev3_close_price_yes       DOUBLE,
+            prev_no_streak                  INTEGER,
+            prev_btc_down_streak            INTEGER,
+            prev_no_count                   INTEGER,
+            prev_btc_down_count             INTEGER,
+            prev_signal_all3_no_btc_down    DOUBLE
         )
     """)
 
@@ -218,12 +241,20 @@ def init_schema(con: duckdb.DuckDBPyConnection) -> None:
         ("orderbook_ticks", "prev3_close_price_yes",  "DOUBLE", None),
         ("orderbook_ticks", "ofi_since_open",         "DOUBLE", None),
         ("orderbook_ticks", "ofi_last_60s",           "DOUBLE", None),
+        ("orderbook_ticks", "btc_vol_1m",             "DOUBLE", None),
+        ("orderbook_ticks", "btc_vol_2m",             "DOUBLE", None),
+        ("orderbook_ticks", "btc_vol_5m",             "DOUBLE", None),
+        ("orderbook_ticks", "btc_vol_since_open",     "DOUBLE", None),
         ("trades",          "yes_best_bid_at_trade",  "DOUBLE", None),
         ("trades",          "yes_best_ask_at_trade",  "DOUBLE", None),
         ("trades",          "btc_price_at_open",      "DOUBLE", None),
         ("trades",          "btc_delta_1min",         "DOUBLE", None),
         ("trades",          "btc_delta_2min",         "DOUBLE", None),
         ("trades",          "btc_delta_3min",         "DOUBLE", None),
+        ("trades",          "btc_vol_1m",             "DOUBLE", None),
+        ("trades",          "btc_vol_2m",             "DOUBLE", None),
+        ("trades",          "btc_vol_5m",             "DOUBLE", None),
+        ("trades",          "btc_vol_since_open",     "DOUBLE", None),
         ("trades",          "prev1_market_id",        "TEXT",   None),
         ("trades",          "prev1_outcome",          "TEXT",   None),
         ("trades",          "prev1_btc_move_pct",     "DOUBLE", None),
@@ -248,6 +279,21 @@ def init_schema(con: duckdb.DuckDBPyConnection) -> None:
         ("btc_markets",     "prev3_outcome",          "TEXT",   None),
         ("btc_markets",     "prev3_btc_move_pct",     "DOUBLE", None),
         ("btc_markets",     "prev3_close_price_yes",  "DOUBLE", None),
+        ("btc_markets",     "prev_no_streak",                  "INTEGER", None),
+        ("btc_markets",     "prev_btc_down_streak",            "INTEGER", None),
+        ("btc_markets",     "prev_no_count",                   "INTEGER", None),
+        ("btc_markets",     "prev_btc_down_count",             "INTEGER", None),
+        ("btc_markets",     "prev_signal_all3_no_btc_down",    "DOUBLE", None),
+        ("orderbook_ticks", "prev_no_streak",                  "INTEGER", None),
+        ("orderbook_ticks", "prev_btc_down_streak",            "INTEGER", None),
+        ("orderbook_ticks", "prev_no_count",                   "INTEGER", None),
+        ("orderbook_ticks", "prev_btc_down_count",             "INTEGER", None),
+        ("orderbook_ticks", "prev_signal_all3_no_btc_down",    "DOUBLE", None),
+        ("trades",          "prev_no_streak",                  "INTEGER", None),
+        ("trades",          "prev_btc_down_streak",            "INTEGER", None),
+        ("trades",          "prev_no_count",                   "INTEGER", None),
+        ("trades",          "prev_btc_down_count",             "INTEGER", None),
+        ("trades",          "prev_signal_all3_no_btc_down",    "DOUBLE", None),
     ]
 
     for table, col, typ, rename_to in _migrations:

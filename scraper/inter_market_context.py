@@ -1,6 +1,7 @@
 """
 Historique des marchés terminés — contexte inter-marchés (séries d’outcomes, momentum BTC).
 Les 3 fenêtres précédentes : outcome, mouvement % BTC sur la fenêtre, prix final YES.
+Agrégats : streaks NO / BTC<0 depuis prev1, comptages, signal binaire « 3× NO et 3× BTC en baisse ».
 """
 from collections import deque
 from typing import Any, Dict, Optional
@@ -63,6 +64,66 @@ def record_completion(
     })
 
 
+def _is_no_outcome(outcome: Any) -> bool:
+    return outcome is not None and str(outcome).upper() == "NO"
+
+
+def _derive_momentum_fields(out: Dict[str, Any]) -> None:
+    """
+    Agrégats depuis prev1..prev3 (prev1 = marché précédent le plus récent).
+    Streaks = consécutifs depuis prev1 ; le signal bear = 3 fenêtres pleines, tout NO + BTC < 0.
+    """
+    slots = []
+    for p in (1, 2, 3):
+        mid = out.get(f"prev{p}_market_id")
+        oc = out.get(f"prev{p}_outcome")
+        btc = out.get(f"prev{p}_btc_move_pct")
+        slots.append((mid, oc, btc))
+
+    no_count = 0
+    down_count = 0
+    for mid, oc, btc in slots:
+        if mid is None:
+            continue
+        if _is_no_outcome(oc):
+            no_count += 1
+        if btc is not None and btc < 0:
+            down_count += 1
+
+    out["prev_no_count"] = no_count
+    out["prev_btc_down_count"] = down_count
+
+    no_streak = 0
+    for mid, oc, _btc in slots:
+        if mid is None:
+            break
+        if _is_no_outcome(oc):
+            no_streak += 1
+        else:
+            break
+    out["prev_no_streak"] = no_streak
+
+    down_streak = 0
+    for mid, _oc, btc in slots:
+        if mid is None:
+            break
+        if btc is not None and btc < 0:
+            down_streak += 1
+        else:
+            break
+    out["prev_btc_down_streak"] = down_streak
+
+    filled3 = all(slots[i][0] is not None for i in range(3))
+    if filled3:
+        all_no = all(_is_no_outcome(slots[i][1]) for i in range(3))
+        all_down = all(
+            slots[i][2] is not None and slots[i][2] < 0 for i in range(3)
+        )
+        out["prev_signal_all3_no_btc_down"] = 1.0 if (all_no and all_down) else 0.0
+    else:
+        out["prev_signal_all3_no_btc_down"] = 0.0
+
+
 def _empty_context() -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     for p in (1, 2, 3):
@@ -71,6 +132,11 @@ def _empty_context() -> Dict[str, Any]:
         out[prefix + "outcome"] = None
         out[prefix + "btc_move_pct"] = None
         out[prefix + "close_price_yes"] = None
+    out["prev_no_streak"] = 0
+    out["prev_btc_down_streak"] = 0
+    out["prev_no_count"] = 0
+    out["prev_btc_down_count"] = 0
+    out["prev_signal_all3_no_btc_down"] = 0.0
     return out
 
 
@@ -94,4 +160,5 @@ def get_context_for_window(window_ts: int) -> Dict[str, Any]:
         out[prefix + "outcome"] = rec["outcome"]
         out[prefix + "btc_move_pct"] = rec["btc_move_pct"]
         out[prefix + "close_price_yes"] = rec["close_price_yes"]
+    _derive_momentum_fields(out)
     return out

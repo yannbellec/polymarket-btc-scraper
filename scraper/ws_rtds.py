@@ -10,9 +10,10 @@ Stockage :
 """
 import asyncio
 import json
+import math
 import time
 from collections import deque
-from typing import Optional
+from typing import Dict, Optional
 
 import websockets
 
@@ -44,6 +45,44 @@ def chainlink_price_at_or_after(target_ts_ms: int) -> Optional[float]:
         if t >= target_ts_ms:
             return p
     return None
+
+
+def _chainlink_log_return_stdev(t_start_ms: int, t_end_ms: int) -> float:
+    """
+    Ecart-type des log-rendements entre ticks Chainlink consecutifs dans [t_start_ms, t_end_ms].
+    Mesure de volatilite realisee (depend de la frequence des ticks RTDS).
+    """
+    if t_end_ms <= t_start_ms:
+        return 0.0
+    ticks = [(t, p) for t, p in _chainlink_ticks if t_start_ms <= t <= t_end_ms]
+    if len(ticks) < 2:
+        return 0.0
+    ticks.sort(key=lambda x: x[0])
+    rets: list[float] = []
+    for i in range(1, len(ticks)):
+        p0, p1 = ticks[i - 1][1], ticks[i][1]
+        if p0 > 0 and p1 > 0:
+            rets.append(math.log(p1 / p0))
+    if len(rets) < 2:
+        return 0.0
+    mean = sum(rets) / len(rets)
+    var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
+    return math.sqrt(var)
+
+
+def get_chainlink_realized_vol_fields(now_ms: int, open_ts_ms: Optional[int] = None) -> Dict[str, float]:
+    """
+    Vol realisee BTC (Chainlink) : fenetres glissantes 1/2/5 min + depuis open du marche.
+    """
+    out: Dict[str, float] = {
+        "btc_vol_1m": _chainlink_log_return_stdev(now_ms - 60_000, now_ms),
+        "btc_vol_2m": _chainlink_log_return_stdev(now_ms - 120_000, now_ms),
+        "btc_vol_5m": _chainlink_log_return_stdev(now_ms - 300_000, now_ms),
+        "btc_vol_since_open": 0.0,
+    }
+    if open_ts_ms and open_ts_ms > 0 and now_ms > open_ts_ms:
+        out["btc_vol_since_open"] = _chainlink_log_return_stdev(open_ts_ms, now_ms)
+    return out
 
 
 def get_btc_spot() -> float:
