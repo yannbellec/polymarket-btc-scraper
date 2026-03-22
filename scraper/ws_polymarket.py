@@ -51,15 +51,14 @@ async def subscribe_tokens(token_ids: list[str]) -> None:
         return
     async with _ws_lock:
         _subscribed_tokens.update(new_tokens)
+        # Ferme la connexion pour forcer une reconnexion complète
+        # Polymarket rejette les subscriptions incrementales sur session existante
         if _ws_ref is not None:
             try:
-                await _ws_ref.send(json.dumps({
-                    "assets_ids": new_tokens,
-                    "type": "market"
-                }))
-                log.info(f"WS Polymarket: subscribed {len(new_tokens)} nouveaux tokens")
-            except Exception as e:
-                log.warning(f"WS subscribe error: {e}")
+                await _ws_ref.close()
+                log.info(f"WS Polymarket: reconnexion forcée pour {len(new_tokens)} nouveaux tokens")
+            except Exception:
+                pass
 
 
 async def _handle_price_change(event: dict) -> None:
@@ -136,7 +135,7 @@ async def _handle_price_change(event: dict) -> None:
             "volume_since_open":     0.0,
             "trade_count_since_open": 0,
             "btc_spot":              btc_spot,
-            "moneyness": btc_spot - market.btc_spot_at_open if market.btc_spot_at_open else 0.0,
+            "moneyness": btc_spot - btc_open if btc_open else 0.0,
         }
         await push("orderbook_ticks", row)
 
