@@ -121,10 +121,15 @@ async def export_incremental() -> list[str]:
         watermark = _watermarks[table]
 
         try:
-            # Seulement les nouvelles lignes
-            count = con.execute(
-                f"SELECT COUNT(*) FROM {table} WHERE {ts_col} > {watermark}"
-            ).fetchone()[0]
+            # Si watermark=0, exporte toute la table sans filtre temporel
+            if watermark == 0:
+                count = con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                query = f"SELECT * FROM {table} ORDER BY {ts_col}"
+            else:
+                count = con.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE {ts_col} > {watermark}"
+                ).fetchone()[0]
+                query = f"SELECT * FROM {table} WHERE {ts_col} > {watermark} ORDER BY {ts_col}"
 
             if count == 0:
                 continue
@@ -133,17 +138,11 @@ async def export_incremental() -> list[str]:
             os.makedirs(folder, exist_ok=True)
             path = f"{folder}/{ts_str}.parquet"
 
-            con.execute(f"""
-                COPY (
-                    SELECT * FROM {table}
-                    WHERE {ts_col} > {watermark}
-                    ORDER BY {ts_col}
-                ) TO '{path}' (FORMAT PARQUET, COMPRESSION ZSTD)
-            """)
+            con.execute(f"COPY ({query}) TO '{path}' (FORMAT PARQUET, COMPRESSION ZSTD)")
 
             # Met à jour le watermark
             new_watermark = con.execute(
-                f"SELECT MAX({ts_col}) FROM {table} WHERE {ts_col} > {watermark}"
+                f"SELECT MAX({ts_col}) FROM {table}"
             ).fetchone()[0]
 
             if new_watermark:
