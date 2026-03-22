@@ -1,8 +1,8 @@
 """
-Buffer mémoire → DuckDB → export incrémental Parquet.
+Buffer memoire -> DuckDB -> export incremental Parquet.
 - DuckDB = buffer de travail depuis le dernier restart
-- Export incrémental = seulement les nouvelles lignes depuis le dernier export
-- Parquet horodaté = jamais écrasé, append-only sur R2
+- Export incremental = seulement les nouvelles lignes depuis le dernier export
+- Parquet horodate = jamais ecrase, append-only sur R2
 """
 import asyncio
 import os
@@ -16,14 +16,22 @@ from monitoring.logger import log
 from config.settings import FLUSH_INTERVAL_SEC
 from storage.schema import get_connection, DB_PATH
 
-TABLES = ["btc_markets", "orderbook_ticks", "trades", "btc_spot_ticks", "market_snapshots"]
+TABLES = [
+    "btc_markets",
+    "orderbook_ticks",
+    "trades",
+    "btc_spot_ticks",           # Chainlink uniquement
+    "btc_spot_ticks_binance",   # Binance uniquement
+    "market_snapshots",
+]
 
 TIMESTAMP_COLS = {
-    "btc_markets":      "open_ts_ms",
-    "orderbook_ticks":  "captured_ts_ms",
-    "trades":           "trade_ts_ms",
-    "btc_spot_ticks":   "ts_ms",
-    "market_snapshots": "snapshot_ts_ms",
+    "btc_markets":            "open_ts_ms",
+    "orderbook_ticks":        "captured_ts_ms",
+    "trades":                 "trade_ts_ms",
+    "btc_spot_ticks":         "ts_ms",
+    "btc_spot_ticks_binance": "ts_ms",
+    "market_snapshots":       "snapshot_ts_ms",
 }
 
 _buffers: dict[str, list[dict]] = {t: [] for t in TABLES}
@@ -70,9 +78,9 @@ async def flush_all() -> int:
 
 def _insert_rows(con: duckdb.DuckDBPyConnection, table: str, rows: list[dict]) -> None:
     df        = pd.DataFrame(rows)
-    pk_tables = {"btc_markets", "trades", "btc_spot_ticks", "market_snapshots"}
+    pk_tables = {"btc_markets", "trades", "btc_spot_ticks", "btc_spot_ticks_binance", "market_snapshots"}
 
-    # Réordonne les colonnes selon le schéma DuckDB
+    # Reordonne les colonnes selon le schema DuckDB
     try:
         schema_cols = [c[0] for c in con.execute(
             f"SELECT column_name FROM information_schema.columns "
@@ -84,7 +92,6 @@ def _insert_rows(con: duckdb.DuckDBPyConnection, table: str, rows: list[dict]) -
         pass
 
     if table in pk_tables:
-        # DuckDB utilise ON CONFLICT DO NOTHING (pas INSERT OR IGNORE)
         try:
             con.execute(f"INSERT INTO {table} SELECT * FROM df ON CONFLICT DO NOTHING")
         except Exception as e:
@@ -97,7 +104,7 @@ def _insert_rows(con: duckdb.DuckDBPyConnection, table: str, rows: list[dict]) -
                     inserted += 1
                 except Exception as e2:
                     log.debug(f"Insert skip [{table}]: {e2}")
-            log.debug(f"{table}: {inserted}/{len(df)} lignes insérées")
+            log.debug(f"{table}: {inserted}/{len(df)} lignes inserees")
     else:
         con.execute(f"INSERT INTO {table} SELECT * FROM df")
 
@@ -140,22 +147,22 @@ async def export_incremental() -> list[str]:
                 _watermarks[table] = int(new_watermark)
 
             paths.append(path)
-            log.info(f"Parquet exporté: {table}/{date_str}/{ts_str}.parquet ({count} lignes)")
+            log.info(f"Parquet exporte: {table}/{date_str}/{ts_str}.parquet ({count} lignes)")
 
         except Exception as e:
-            log.error(f"Export incrémental [{table}]: {e}")
+            log.error(f"Export incremental [{table}]: {e}")
 
     return paths
 
 
 async def flush_loop() -> None:
-    log.info(f"Writer flush loop démarré (toutes les {FLUSH_INTERVAL_SEC}s)")
+    log.info(f"Writer flush loop demarre (toutes les {FLUSH_INTERVAL_SEC}s)")
     while True:
         await asyncio.sleep(FLUSH_INTERVAL_SEC)
         try:
             n = await flush_all()
             if n > 0:
-                log.info(f"Flush automatique: {n} lignes écrites en DuckDB")
+                log.info(f"Flush automatique: {n} lignes ecrites en DuckDB")
         except Exception as e:
             log.error(f"Flush loop error: {e}")
 

@@ -1,6 +1,7 @@
 """
-Schéma DuckDB complet — 5 tables.
-Appelé une seule fois au démarrage du scraper.
+Schema DuckDB complet — 6 tables.
+btc_spot_ticks       = Chainlink uniquement (reference officielle Polymarket)
+btc_spot_ticks_binance = Binance uniquement (bonus, source secondaire)
 """
 import duckdb
 from monitoring.logger import log
@@ -9,7 +10,7 @@ DB_PATH = "data/btc_scraper.duckdb"
 
 
 def init_schema(con: duckdb.DuckDBPyConnection) -> None:
-    log.info("Initialisation du schéma DuckDB...")
+    log.info("Initialisation du schema DuckDB...")
 
     con.execute("""
         CREATE TABLE IF NOT EXISTS btc_markets (
@@ -94,8 +95,20 @@ def init_schema(con: duckdb.DuckDBPyConnection) -> None:
         )
     """)
 
+    # Chainlink uniquement — source officielle de resolution Polymarket
     con.execute("""
         CREATE TABLE IF NOT EXISTS btc_spot_ticks (
+            ts_ms               BIGINT PRIMARY KEY,
+            price               DOUBLE,
+            price_delta_1s      DOUBLE,
+            price_delta_30s     DOUBLE,
+            volatility_1min     DOUBLE
+        )
+    """)
+
+    # Binance — source secondaire, stockee separement
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS btc_spot_ticks_binance (
             ts_ms               BIGINT PRIMARY KEY,
             price               DOUBLE,
             bid                 DOUBLE,
@@ -134,7 +147,7 @@ def init_schema(con: duckdb.DuckDBPyConnection) -> None:
         )
     """)
 
-    log.info("Schéma DuckDB initialisé — 5 tables prêtes")
+    log.info("Schema DuckDB initialise — 6 tables pretes")
 
 
 def get_connection() -> duckdb.DuckDBPyConnection:
