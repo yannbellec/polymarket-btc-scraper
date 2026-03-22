@@ -248,7 +248,7 @@ async def _handle_last_trade(event: dict) -> None:
         "trade_type":                 event.get("type", "TRADE"),
         "time_to_expiry_at_trade_ms": tte_ms,
         "btc_spot_at_trade":          btc_spot,
-        "moneyness_at_trade":         0.0,
+        "moneyness_at_trade":         btc_spot - _market_to_btc_open.get(market_id, 0.0),
         "slippage_vs_mid":            slippage,
     })
 
