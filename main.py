@@ -1,6 +1,13 @@
 """
 Point d'entrée principal — BTC Polymarket Scraper.
-Process indépendant du bot météo.
+Architecture :
+  rtds (Binance+Chainlink) → prix BTC temps réel
+  discoverer               → marchés BTC 5-min
+  polymarket_ws            → book + trades temps réel
+  flush_loop               → buffer → DuckDB toutes les 60s
+  upload_loop              → DuckDB → Parquet horodaté → R2 toutes les 5 min
+  expiry_watcher           → snapshots à l'expiry
+  status_loop              → monitoring toutes les 60s
 """
 import asyncio
 import os
@@ -14,66 +21,18 @@ from scraper.ws_rtds import binance_ws_loop, get_btc_spot
 from scraper.ws_polymarket import polymarket_ws_loop, register_market, subscribe_tokens
 from scraper.discoverer import discovery_loop, register_on_new_market, get_active_markets
 from scraper.snapshot_builder import build_snapshot
-from storage.writer import flush_loop, flush_all, get_buffer_stats
-from storage.r2_uploader import upload_loop
-
-
-async def restore_from_r2() -> None:
-    """
-    Au démarrage, télécharge les Parquet du jour depuis R2
-    et les importe dans DuckDB pour continuité.
-    """
-    from storage.r2_uploader import _get_client
-    from storage.schema import get_connection
-    from datetime import datetime, timezone
-    import duckdb
-
-    client = _get_client()
-    if client is None:
-        log.info("R2 non configuré — démarrage sans restauration")
-        return
-
-    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    tables   = ["btc_markets", "orderbook_ticks", "trades",
-                "btc_spot_ticks", "market_snapshots"]
-    restored = 0
-
-    os.makedirs(f"data/parquet/{date_str}", exist_ok=True)
-
-    bucket = os.getenv("R2_BUCKET_NAME", "polymarket-btc-data")
-
-    for table in tables:
-        r2_key     = f"parquet/{date_str}/{table}.parquet"
-        local_path = f"data/parquet/{date_str}/{table}.parquet"
-        try:
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(
-                None,
-                lambda k=r2_key, p=local_path: client.download_file(bucket, k, p)
-            )
-            con = get_connection()
-            con.execute(
-                f"INSERT OR IGNORE INTO {table} SELECT * FROM read_parquet('{local_path}')"
-            )
-            count = con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-            log.info(f"R2 restore: {table} — {count} lignes importées")
-            restored += 1
-        except Exception as e:
-            log.debug(f"R2 restore [{table}]: pas de fichier existant — démarrage propre")
-
-    if restored:
-        log.info(f"Restauration R2 terminée — {restored} tables rechargées")
-    else:
-        log.info("Aucune donnée R2 à restaurer — démarrage propre")
+from storage.writer import flush_loop, flush_all, get_buffer_stats, export_incremental
+from storage.r2_uploader import upload_loop, upload_file
 
 
 async def on_new_market(market) -> None:
     register_market(market)
     await subscribe_tokens([market.token_id_yes, market.token_id_no])
-    log.info(f"Marché enregistré pour WS: {market.question[:60]}")
+    log.info(f"Marché enregistré: {market.question[:60]}")
 
 
 async def expiry_watcher_loop() -> None:
+    """Déclenche snapshot + export immédiat à chaque expiry."""
     triggered = set()
     while True:
         await asyncio.sleep(5)
@@ -85,14 +44,19 @@ async def expiry_watcher_loop() -> None:
                 await asyncio.sleep(5)
                 await flush_all()
                 await build_snapshot(market_id, market_obj=market, winning_outcome=None)
+                # Export immédiat du snapshot vers R2
+                await flush_all()
+                paths = await export_incremental()
+                for path in paths:
+                    await upload_file(path)
 
 
 async def status_loop() -> None:
     while True:
         await asyncio.sleep(60)
-        stats = get_buffer_stats()
+        stats         = get_buffer_stats()
         total_pending = sum(stats.values())
-        log.info(f"Status — buffers: {stats} | total pending: {total_pending}")
+        log.info(f"Status — buffers: {stats} | pending: {total_pending}")
 
 
 async def run() -> None:
@@ -102,9 +66,6 @@ async def run() -> None:
 
     alert_start()
     register_on_new_market(on_new_market)
-
-    # Restaure depuis R2 si disponible
-    await restore_from_r2()
 
     tasks = [
         asyncio.create_task(binance_ws_loop(),            name="rtds"),
@@ -136,8 +97,11 @@ async def run() -> None:
 
     finally:
         log.info("Flush final avant arrêt...")
-        n = await flush_all()
-        log.info(f"Flush final: {n} lignes écrites")
+        await flush_all()
+        paths = await export_incremental()
+        for path in paths:
+            await upload_file(path)
+        log.info("Export final terminé")
         alert_stop("Arrêt propre")
         for task in tasks:
             task.cancel()

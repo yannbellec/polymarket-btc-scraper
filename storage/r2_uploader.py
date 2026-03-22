@@ -1,10 +1,11 @@
 """
-Upload des fichiers Parquet vers Cloudflare R2.
-R2 est compatible S3 — on utilise boto3.
+Upload incrémental vers Cloudflare R2.
+Chaque fichier Parquet est uploadé avec sa clé complète.
+Structure R2 : parquet/{table}/{date}/{hhmmss}.parquet
+Jamais d'écrasement — append-only.
 """
 import asyncio
 import os
-from datetime import datetime, timezone
 
 import boto3
 from botocore.exceptions import ClientError
@@ -37,13 +38,14 @@ def _get_client():
 async def upload_file(local_path: str) -> bool:
     """
     Upload un fichier Parquet vers R2.
-    La clé R2 conserve la structure de dossiers : data/parquet/YYYY-MM-DD/table.parquet
+    Clé R2 = chemin local sans le préfixe 'data/'
+    ex: data/parquet/orderbook_ticks/2026-03-22/143500.parquet
+     → parquet/orderbook_ticks/2026-03-22/143500.parquet
     """
     client = _get_client()
     if client is None:
         return False
 
-    # Clé R2 : retire le préfixe "data/" pour garder parquet/date/table.parquet
     r2_key = local_path.replace("data/", "", 1)
 
     try:
@@ -59,41 +61,36 @@ async def upload_file(local_path: str) -> bool:
         return False
 
 
-async def upload_all_parquet(date_str: str | None = None) -> int:
-    """Upload tous les fichiers Parquet du jour vers R2."""
-    if date_str is None:
-        date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-    parquet_dir = f"data/parquet/{date_str}"
-    if not os.path.exists(parquet_dir):
-        return 0
-
-    files = [
-        os.path.join(parquet_dir, f)
-        for f in os.listdir(parquet_dir)
-        if f.endswith(".parquet")
-    ]
-
-    uploaded = 0
-    for path in files:
-        if await upload_file(path):
-            uploaded += 1
-
-    if uploaded:
-        log.info(f"R2 sync: {uploaded}/{len(files)} fichiers uploadés")
-
-    return uploaded
-
-
 async def upload_loop() -> None:
-    """Boucle d'upload automatique toutes les UPLOAD_INTERVAL_SEC secondes."""
+    """
+    Toutes les UPLOAD_INTERVAL_SEC secondes :
+    1. Flush les buffers vers DuckDB
+    2. Export incrémental vers Parquet horodaté
+    3. Upload chaque nouveau fichier vers R2
+    """
+    from storage.writer import flush_all, export_incremental
+
     log.info(f"R2 upload loop démarré (toutes les {UPLOAD_INTERVAL_SEC}s)")
+
     while True:
         await asyncio.sleep(UPLOAD_INTERVAL_SEC)
         try:
-            from storage.writer import export_parquet
-            paths = await export_parquet()
+            # Flush d'abord
+            n = await flush_all()
+            if n > 0:
+                log.info(f"Pre-upload flush: {n} lignes")
+
+            # Export incrémental
+            paths = await export_incremental()
+
+            # Upload chaque nouveau fichier
+            uploaded = 0
             for path in paths:
-                await upload_file(path)
+                if await upload_file(path):
+                    uploaded += 1
+
+            if uploaded:
+                log.info(f"R2 sync: {uploaded}/{len(paths)} fichiers uploadés")
+
         except Exception as e:
             log.error(f"Upload loop error: {e}")
