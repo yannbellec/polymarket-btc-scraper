@@ -36,6 +36,11 @@ _trade_count: dict[str, int] = {}
 _volume_cumul: dict[str, float] = {}
 _inter_market_ctx: Dict[str, Dict[str, Any]] = {}
 
+# OFI : cumul signe (BUY +size, SELL -size) ; deque (ts_ms, signed_size) pour fenêtre 60s
+_ofi_cumul: Dict[str, float] = {}
+_ofi_ring: Dict[str, deque] = {}
+_OFI_WINDOW_MS = 60_000
+
 _YES_MID_RING_LEN = 10
 _yes_mid_ring: dict[str, deque] = {}
 
@@ -102,6 +107,36 @@ def get_inter_market_fields(market_id: str) -> Dict[str, Any]:
     out = empty_inter_market_fields()
     out.update(_inter_market_ctx.get(market_id, {}))
     return out
+
+
+def _signed_trade_size(side: str, size: float) -> float:
+    s = (side or "").upper()
+    if s in ("BUY", "B"):
+        return size
+    if s in ("SELL", "S"):
+        return -size
+    return 0.0
+
+
+def _apply_trade_ofi(market_id: str, ts_ms: int, signed: float) -> None:
+    if signed == 0.0:
+        return
+    _ofi_cumul[market_id] = _ofi_cumul.get(market_id, 0.0) + signed
+    ring = _ofi_ring.setdefault(market_id, deque())
+    ring.append((ts_ms, signed))
+
+
+def get_ofi_fields(market_id: str, now_ms: int) -> Dict[str, float]:
+    """ofi_since_open = cumul depuis le début du suivi ; ofi_last_60s = somme signée sur 60s glissantes."""
+    since = float(_ofi_cumul.get(market_id, 0.0))
+    ring = _ofi_ring.get(market_id)
+    cutoff = now_ms - _OFI_WINDOW_MS
+    last_60 = 0.0
+    if ring:
+        while ring and ring[0][0] < cutoff:
+            ring.popleft()
+        last_60 = sum(x[1] for x in ring)
+    return {"ofi_since_open": since, "ofi_last_60s": last_60}
 
 
 def register_market(market) -> None:
@@ -183,6 +218,7 @@ async def _handle_price_change(event: dict) -> None:
         delta_10     = _mid_delta_10_ticks(market_id, mid)
         btc_hz       = get_btc_horizon_fields(market_id, now_ms)
         im           = get_inter_market_fields(market_id)
+        ofi          = get_ofi_fields(market_id, now_ms)
         spread_ma    = _update_spread_ma(market_id, spread)
         # Sur price_change, liquidite totale = 0 (non fournie) — MA calculee sur les book events
         liq_ma       = _update_liq_ma(market_id, 0.0, 0.0)
@@ -219,6 +255,7 @@ async def _handle_price_change(event: dict) -> None:
             "yes_liq_ma_60":         liq_ma,
             **btc_hz,
             **im,
+            **ofi,
         }
         await push("orderbook_ticks", row)
 
@@ -268,6 +305,7 @@ async def _handle_book(event: dict) -> None:
     delta_10  = _mid_delta_10_ticks(market_id, mid)
     btc_hz    = get_btc_horizon_fields(market_id, now_ms)
     im        = get_inter_market_fields(market_id)
+    ofi       = get_ofi_fields(market_id, now_ms)
     spread_ma = _update_spread_ma(market_id, spread)
     liq_ma    = _update_liq_ma(market_id, total_bid_liq, total_ask_liq)
 
@@ -303,6 +341,7 @@ async def _handle_book(event: dict) -> None:
         "yes_liq_ma_60":         liq_ma,
         **btc_hz,
         **im,
+        **ofi,
     }
     await push("orderbook_ticks", row)
 
@@ -325,6 +364,7 @@ async def _handle_last_trade(event: dict) -> None:
     tte_ms    = max(0, expiry_ms - ts_ms)
     mid       = _last_mid.get(market_id, price)
     slippage  = price - mid if mid else 0.0
+    _apply_trade_ofi(market_id, ts_ms, _signed_trade_size(side, size))
     btc_hz    = get_btc_horizon_fields(market_id, ts_ms)
     im        = get_inter_market_fields(market_id)
 

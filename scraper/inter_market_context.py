@@ -5,8 +5,43 @@ Les 3 fenêtres précédentes : outcome, mouvement % BTC sur la fenêtre, prix f
 from collections import deque
 from typing import Any, Dict, Optional
 
+from monitoring.logger import log
+
 # Fenêtres résolues (ordre chronologique d’insertion ; filtrage par window_ts au read)
 _COMPLETIONS: deque = deque(maxlen=500)
+
+
+def bootstrap_from_duckdb(con: Any) -> None:
+    """
+    Au démarrage (init_schema), recharge les derniers snapshots résolus depuis DuckDB
+    pour que get_context_for_window fonctionne avant le prochain expiry.
+    """
+    global _COMPLETIONS
+    try:
+        rows = con.execute("""
+            SELECT m.window_ts, s.market_id, s.winning_outcome, s.btc_move_pct, s.close_price_yes
+            FROM market_snapshots s
+            INNER JOIN btc_markets m ON s.market_id = m.market_id
+            WHERE s.winning_outcome IS NOT NULL
+            ORDER BY m.window_ts DESC
+            LIMIT 100
+        """).fetchall()
+    except Exception as e:
+        log.warning(f"inter_market_context bootstrap DuckDB: {e}")
+        return
+    if not rows:
+        return
+    _COMPLETIONS.clear()
+    for r in sorted(rows, key=lambda x: int(x[0])):
+        wts, mid, outcome, btc_m, close_y = r
+        _COMPLETIONS.append({
+            "window_ts": int(wts),
+            "market_id": str(mid),
+            "outcome": outcome,
+            "btc_move_pct": float(btc_m) if btc_m is not None else 0.0,
+            "close_price_yes": float(close_y) if close_y is not None else 0.0,
+        })
+    log.info(f"inter_market_context: {len(rows)} snapshots rechargés depuis DuckDB")
 
 
 def record_completion(

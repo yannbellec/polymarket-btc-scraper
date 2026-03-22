@@ -13,7 +13,7 @@ from monitoring.logger import log
 from storage.writer import push, next_tick_id
 from scraper.ws_rtds import get_btc_spot
 from scraper.discoverer import get_active_markets
-from scraper.ws_polymarket import get_btc_horizon_fields, get_inter_market_fields
+from scraper.ws_polymarket import get_btc_horizon_fields, get_inter_market_fields, get_ofi_fields
 
 # ── Historique de prix par marché pour les deltas ─────────────────────────────
 # market_id → liste des 10 derniers mid YES
@@ -122,6 +122,7 @@ async def _snapshot_market(client: httpx.AsyncClient, market) -> None:
 
     btc_hz = get_btc_horizon_fields(mid, now_ms)
     im     = get_inter_market_fields(mid)
+    ofi    = get_ofi_fields(mid, now_ms)
 
     row = {
         "tick_id":                next_tick_id(),
@@ -159,6 +160,7 @@ async def _snapshot_market(client: httpx.AsyncClient, market) -> None:
         "moneyness": btc_spot - market.btc_spot_at_open if market.btc_spot_at_open else 0.0,
         **btc_hz,
         **im,
+        **ofi,
     }
 
     await push("orderbook_ticks", row)

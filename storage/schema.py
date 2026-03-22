@@ -102,7 +102,9 @@ def init_schema(con: duckdb.DuckDBPyConnection) -> None:
             prev3_market_id         TEXT,
             prev3_outcome           TEXT,
             prev3_btc_move_pct      DOUBLE,
-            prev3_close_price_yes   DOUBLE
+            prev3_close_price_yes   DOUBLE,
+            ofi_since_open          DOUBLE,
+            ofi_last_60s            DOUBLE
         )
     """)
 
@@ -214,6 +216,8 @@ def init_schema(con: duckdb.DuckDBPyConnection) -> None:
         ("orderbook_ticks", "prev3_outcome",          "TEXT",   None),
         ("orderbook_ticks", "prev3_btc_move_pct",     "DOUBLE", None),
         ("orderbook_ticks", "prev3_close_price_yes",  "DOUBLE", None),
+        ("orderbook_ticks", "ofi_since_open",         "DOUBLE", None),
+        ("orderbook_ticks", "ofi_last_60s",           "DOUBLE", None),
         ("trades",          "yes_best_bid_at_trade",  "DOUBLE", None),
         ("trades",          "yes_best_ask_at_trade",  "DOUBLE", None),
         ("trades",          "btc_price_at_open",      "DOUBLE", None),
@@ -257,6 +261,13 @@ def init_schema(con: duckdb.DuckDBPyConnection) -> None:
                 con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
             except Exception:
                 pass
+
+    try:
+        from scraper.inter_market_context import bootstrap_from_duckdb
+
+        bootstrap_from_duckdb(con)
+    except Exception as e:
+        log.warning(f"inter_market_context bootstrap: {e}")
 
     log.info("Schema DuckDB initialise — 6 tables pretes")
 
