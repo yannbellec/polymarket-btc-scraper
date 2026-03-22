@@ -12,6 +12,7 @@ import asyncio
 import json
 import time
 from collections import deque
+from typing import Optional
 
 import websockets
 
@@ -32,6 +33,17 @@ _chainlink_history: deque = deque(maxlen=60)
 _chainlink_30s_buf: deque = deque(maxlen=30)
 _binance_history:   deque = deque(maxlen=60)
 _binance_30s_buf:   deque = deque(maxlen=30)
+
+# (ts_ms, price) Chainlink — pour horizons BTC depuis open_ts marché (~10 min)
+_chainlink_ticks: deque = deque(maxlen=600)
+
+
+def chainlink_price_at_or_after(target_ts_ms: int) -> Optional[float]:
+    """Premier tick Chainlink avec ts >= target_ts_ms (prix à horizon fixe)."""
+    for t, p in _chainlink_ticks:
+        if t >= target_ts_ms:
+            return p
+    return None
 
 
 def get_btc_spot() -> float:
@@ -61,6 +73,7 @@ async def _handle_price(payload: dict, source: str) -> None:
 
     if source == "chainlink":
         _state["price_chainlink"] = price
+        _chainlink_ticks.append((ts_ms, price))
         _chainlink_history.append(price)
         _chainlink_30s_buf.append(price)
 
