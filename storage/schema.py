@@ -1,6 +1,6 @@
 """
 Schema DuckDB complet — 6 tables.
-btc_spot_ticks       = Chainlink uniquement (reference officielle Polymarket)
+btc_spot_ticks         = Chainlink uniquement (reference officielle Polymarket)
 btc_spot_ticks_binance = Binance uniquement (bonus, source secondaire)
 """
 import duckdb
@@ -40,7 +40,19 @@ def init_schema(con: duckdb.DuckDBPyConnection) -> None:
             resolved                BOOLEAN DEFAULT FALSE,
             winning_outcome         TEXT,
             final_btc_price         DOUBLE,
-            closed_ts_ms            BIGINT
+            closed_ts_ms            BIGINT,
+            prev1_market_id         TEXT,
+            prev1_outcome           TEXT,
+            prev1_btc_move_pct      DOUBLE,
+            prev1_close_price_yes   DOUBLE,
+            prev2_market_id         TEXT,
+            prev2_outcome           TEXT,
+            prev2_btc_move_pct      DOUBLE,
+            prev2_close_price_yes   DOUBLE,
+            prev3_market_id         TEXT,
+            prev3_outcome           TEXT,
+            prev3_btc_move_pct      DOUBLE,
+            prev3_close_price_yes   DOUBLE
         )
     """)
 
@@ -67,35 +79,70 @@ def init_schema(con: duckdb.DuckDBPyConnection) -> None:
             yes_spread              DOUBLE,
             yes_spread_pct          DOUBLE,
             book_imbalance          DOUBLE,
-            yes_price_delta_1s      DOUBLE,
+            yes_price_delta_tick    DOUBLE,
             yes_price_delta_10s     DOUBLE,
             volume_since_open       DOUBLE,
             trade_count_since_open  INTEGER,
             btc_spot                DOUBLE,
-            moneyness               DOUBLE
+            moneyness               DOUBLE,
+            yes_spread_ma_60        DOUBLE,
+            yes_liq_ma_60           DOUBLE,
+            btc_price_at_open       DOUBLE,
+            btc_delta_1min          DOUBLE,
+            btc_delta_2min          DOUBLE,
+            btc_delta_3min          DOUBLE,
+            prev1_market_id         TEXT,
+            prev1_outcome           TEXT,
+            prev1_btc_move_pct      DOUBLE,
+            prev1_close_price_yes   DOUBLE,
+            prev2_market_id         TEXT,
+            prev2_outcome           TEXT,
+            prev2_btc_move_pct      DOUBLE,
+            prev2_close_price_yes   DOUBLE,
+            prev3_market_id         TEXT,
+            prev3_outcome           TEXT,
+            prev3_btc_move_pct      DOUBLE,
+            prev3_close_price_yes   DOUBLE
         )
     """)
 
     con.execute("""
         CREATE TABLE IF NOT EXISTS trades (
-            trade_id                TEXT PRIMARY KEY,
-            market_id               TEXT,
-            token_id                TEXT,
-            outcome                 TEXT,
-            price                   DOUBLE,
-            size                    DOUBLE,
-            side                    TEXT,
-            trade_ts_ms             BIGINT,
-            fee_rate_bps            DOUBLE,
-            trade_type              TEXT,
-            time_to_expiry_at_trade_ms BIGINT,
-            btc_spot_at_trade       DOUBLE,
-            moneyness_at_trade      DOUBLE,
-            slippage_vs_mid         DOUBLE
+            trade_id                    TEXT PRIMARY KEY,
+            market_id                   TEXT,
+            token_id                    TEXT,
+            outcome                     TEXT,
+            price                       DOUBLE,
+            size                        DOUBLE,
+            side                        TEXT,
+            trade_ts_ms                 BIGINT,
+            fee_rate_bps                DOUBLE,
+            trade_type                  TEXT,
+            time_to_expiry_at_trade_ms  BIGINT,
+            btc_spot_at_trade           DOUBLE,
+            moneyness_at_trade          DOUBLE,
+            slippage_vs_mid             DOUBLE,
+            yes_best_bid_at_trade       DOUBLE,
+            yes_best_ask_at_trade       DOUBLE,
+            btc_price_at_open           DOUBLE,
+            btc_delta_1min              DOUBLE,
+            btc_delta_2min              DOUBLE,
+            btc_delta_3min              DOUBLE,
+            prev1_market_id             TEXT,
+            prev1_outcome               TEXT,
+            prev1_btc_move_pct          DOUBLE,
+            prev1_close_price_yes       DOUBLE,
+            prev2_market_id             TEXT,
+            prev2_outcome               TEXT,
+            prev2_btc_move_pct          DOUBLE,
+            prev2_close_price_yes       DOUBLE,
+            prev3_market_id             TEXT,
+            prev3_outcome               TEXT,
+            prev3_btc_move_pct          DOUBLE,
+            prev3_close_price_yes       DOUBLE
         )
     """)
 
-    # Chainlink uniquement — source officielle de resolution Polymarket
     con.execute("""
         CREATE TABLE IF NOT EXISTS btc_spot_ticks (
             ts_ms               BIGINT PRIMARY KEY,
@@ -106,7 +153,6 @@ def init_schema(con: duckdb.DuckDBPyConnection) -> None:
         )
     """)
 
-    # Binance — source secondaire, stockee separement
     con.execute("""
         CREATE TABLE IF NOT EXISTS btc_spot_ticks_binance (
             ts_ms               BIGINT PRIMARY KEY,
@@ -146,6 +192,71 @@ def init_schema(con: duckdb.DuckDBPyConnection) -> None:
             snapshot_ts_ms          BIGINT
         )
     """)
+
+    # Migrations idempotentes pour DuckDB existant
+    _migrations = [
+        ("orderbook_ticks", "yes_price_delta_1s",    None,     "yes_price_delta_tick"),
+        ("orderbook_ticks", "yes_spread_ma_60",       "DOUBLE", None),
+        ("orderbook_ticks", "yes_liq_ma_60",          "DOUBLE", None),
+        ("orderbook_ticks", "btc_price_at_open",      "DOUBLE", None),
+        ("orderbook_ticks", "btc_delta_1min",         "DOUBLE", None),
+        ("orderbook_ticks", "btc_delta_2min",         "DOUBLE", None),
+        ("orderbook_ticks", "btc_delta_3min",         "DOUBLE", None),
+        ("orderbook_ticks", "prev1_market_id",        "TEXT",   None),
+        ("orderbook_ticks", "prev1_outcome",          "TEXT",   None),
+        ("orderbook_ticks", "prev1_btc_move_pct",     "DOUBLE", None),
+        ("orderbook_ticks", "prev1_close_price_yes",  "DOUBLE", None),
+        ("orderbook_ticks", "prev2_market_id",        "TEXT",   None),
+        ("orderbook_ticks", "prev2_outcome",          "TEXT",   None),
+        ("orderbook_ticks", "prev2_btc_move_pct",     "DOUBLE", None),
+        ("orderbook_ticks", "prev2_close_price_yes",  "DOUBLE", None),
+        ("orderbook_ticks", "prev3_market_id",        "TEXT",   None),
+        ("orderbook_ticks", "prev3_outcome",          "TEXT",   None),
+        ("orderbook_ticks", "prev3_btc_move_pct",     "DOUBLE", None),
+        ("orderbook_ticks", "prev3_close_price_yes",  "DOUBLE", None),
+        ("trades",          "yes_best_bid_at_trade",  "DOUBLE", None),
+        ("trades",          "yes_best_ask_at_trade",  "DOUBLE", None),
+        ("trades",          "btc_price_at_open",      "DOUBLE", None),
+        ("trades",          "btc_delta_1min",         "DOUBLE", None),
+        ("trades",          "btc_delta_2min",         "DOUBLE", None),
+        ("trades",          "btc_delta_3min",         "DOUBLE", None),
+        ("trades",          "prev1_market_id",        "TEXT",   None),
+        ("trades",          "prev1_outcome",          "TEXT",   None),
+        ("trades",          "prev1_btc_move_pct",     "DOUBLE", None),
+        ("trades",          "prev1_close_price_yes",  "DOUBLE", None),
+        ("trades",          "prev2_market_id",        "TEXT",   None),
+        ("trades",          "prev2_outcome",          "TEXT",   None),
+        ("trades",          "prev2_btc_move_pct",     "DOUBLE", None),
+        ("trades",          "prev2_close_price_yes",  "DOUBLE", None),
+        ("trades",          "prev3_market_id",        "TEXT",   None),
+        ("trades",          "prev3_outcome",          "TEXT",   None),
+        ("trades",          "prev3_btc_move_pct",     "DOUBLE", None),
+        ("trades",          "prev3_close_price_yes",  "DOUBLE", None),
+        ("btc_markets",     "prev1_market_id",        "TEXT",   None),
+        ("btc_markets",     "prev1_outcome",          "TEXT",   None),
+        ("btc_markets",     "prev1_btc_move_pct",     "DOUBLE", None),
+        ("btc_markets",     "prev1_close_price_yes",  "DOUBLE", None),
+        ("btc_markets",     "prev2_market_id",        "TEXT",   None),
+        ("btc_markets",     "prev2_outcome",          "TEXT",   None),
+        ("btc_markets",     "prev2_btc_move_pct",     "DOUBLE", None),
+        ("btc_markets",     "prev2_close_price_yes",  "DOUBLE", None),
+        ("btc_markets",     "prev3_market_id",        "TEXT",   None),
+        ("btc_markets",     "prev3_outcome",          "TEXT",   None),
+        ("btc_markets",     "prev3_btc_move_pct",     "DOUBLE", None),
+        ("btc_markets",     "prev3_close_price_yes",  "DOUBLE", None),
+    ]
+
+    for table, col, typ, rename_to in _migrations:
+        if rename_to:
+            try:
+                con.execute(f"ALTER TABLE {table} RENAME COLUMN {col} TO {rename_to}")
+            except Exception:
+                pass
+        else:
+            try:
+                con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
+            except Exception:
+                pass
 
     log.info("Schema DuckDB initialise — 6 tables pretes")
 

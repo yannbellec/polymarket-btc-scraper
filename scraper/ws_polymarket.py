@@ -4,19 +4,20 @@ Capture TOUS les events en temps réel :
   - price_change → orderbook_ticks (chaque mouvement de book)
   - book         → orderbook_ticks (snapshot complet)
   - last_trade_price → trades
-Remplace le book_poller REST — fréquence event-driven vs poll 1s.
 """
 import asyncio
 import json
 import time
-from typing import Callable
+from collections import deque
+from typing import Any, Callable, Dict, Optional
 
 import websockets
 
 from config.settings import POLYMARKET_WS_URL
 from monitoring.logger import log
 from storage.writer import push, next_tick_id
-from scraper.ws_rtds import get_btc_spot
+from scraper.ws_rtds import get_btc_spot, chainlink_price_at_or_after
+from scraper.inter_market_context import empty_inter_market_fields
 
 _subscribed_tokens: set[str] = set()
 _ws_ref = None
@@ -26,12 +27,81 @@ _token_to_market: dict[str, str] = {}
 _token_to_outcome: dict[str, str] = {}
 _market_to_expiry: dict[str, int] = {}
 _market_to_btc_open: dict[str, float] = {}
+_market_open_ts_ms: dict[str, int] = {}
+_btc_horizon_delta: Dict[str, Dict[str, Optional[float]]] = {}
 _last_mid: dict[str, float] = {}
 _last_bid: dict[str, float] = {}
 _last_ask: dict[str, float] = {}
 _trade_count: dict[str, int] = {}
 _volume_cumul: dict[str, float] = {}
+_inter_market_ctx: Dict[str, Dict[str, Any]] = {}
 
+_YES_MID_RING_LEN = 10
+_yes_mid_ring: dict[str, deque] = {}
+
+# Moyennes mobiles spread et liquidite — fenetres glissantes de 60 ticks
+_MA_LEN = 60
+_spread_ring: dict[str, deque] = {}
+_liq_ring: dict[str, deque] = {}
+
+
+def _horizon_state(market_id: str) -> Dict[str, Optional[float]]:
+    return _btc_horizon_delta.setdefault(market_id, {"1": None, "2": None, "3": None})
+
+
+def get_btc_horizon_fields(market_id: str, now_ms: int) -> Dict[str, Any]:
+    p0 = float(_market_to_btc_open.get(market_id, 0.0))
+    open_ts = int(_market_open_ts_ms.get(market_id, 0))
+    out: Dict[str, Any] = {
+        "btc_price_at_open": p0,
+        "btc_delta_1min": None,
+        "btc_delta_2min": None,
+        "btc_delta_3min": None,
+    }
+    if not open_ts or p0 <= 0:
+        return out
+    st = _horizon_state(market_id)
+    for m, sk in ((1, "1"), (2, "2"), (3, "3")):
+        col = f"btc_delta_{m}min" if m > 1 else "btc_delta_1min"
+        if st[sk] is not None:
+            out[col] = st[sk]
+        elif now_ms >= open_ts + m * 60_000:
+            px = chainlink_price_at_or_after(open_ts + m * 60_000)
+            if px is not None:
+                d = px - p0
+                st[sk] = d
+                out[col] = d
+    return out
+
+
+def _mid_delta_10_ticks(market_id: str, mid: float) -> float:
+    d = _yes_mid_ring.setdefault(market_id, deque(maxlen=_YES_MID_RING_LEN))
+    if len(d) >= _YES_MID_RING_LEN:
+        delta = mid - d[0]
+    else:
+        delta = 0.0
+    d.append(mid)
+    return delta
+
+
+def _update_spread_ma(market_id: str, spread: float) -> float:
+    """Moyenne mobile du spread sur les 60 derniers ticks."""
+    ring = _spread_ring.setdefault(market_id, deque(maxlen=_MA_LEN))
+    ring.append(spread)
+    return sum(ring) / len(ring)
+
+
+def _update_liq_ma(market_id: str, total_bid_liq: float, total_ask_liq: float) -> float:
+    """Moyenne mobile de la liquidite totale (bid+ask) sur les 60 derniers ticks."""
+    ring = _liq_ring.setdefault(market_id, deque(maxlen=_MA_LEN))
+    ring.append(total_bid_liq + total_ask_liq)
+    return sum(ring) / len(ring)
+
+
+def get_inter_market_fields(market_id: str) -> Dict[str, Any]:
+    out = empty_inter_market_fields()
+    out.update(_inter_market_ctx.get(market_id, {}))
+    return out
 
 
 def register_market(market) -> None:
@@ -43,6 +113,9 @@ def register_market(market) -> None:
         _token_to_outcome[market.token_id_no] = "NO"
     _market_to_expiry[market.market_id] = market.expiry_ts_ms
     _market_to_btc_open[market.market_id] = market.btc_spot_at_open
+    _market_open_ts_ms[market.market_id] = int(market.open_ts_ms)
+    ctx = getattr(market, "inter_context", None)
+    _inter_market_ctx[market.market_id] = ctx if isinstance(ctx, dict) else empty_inter_market_fields()
 
 
 async def subscribe_tokens(token_ids: list[str]) -> None:
@@ -51,22 +124,26 @@ async def subscribe_tokens(token_ids: list[str]) -> None:
         return
     async with _ws_lock:
         _subscribed_tokens.update(new_tokens)
-        # Ferme la connexion pour forcer une reconnexion complète
-        # Polymarket rejette les subscriptions incrementales sur session existante
-        if _ws_ref is not None:
-            try:
-                await _ws_ref.close()
-                log.info(f"WS Polymarket: reconnexion forcée pour {len(new_tokens)} nouveaux tokens")
-            except Exception:
-                pass
+        ws = _ws_ref
+        if ws is None:
+            return
+        try:
+            await ws.send(json.dumps({
+                "assets_ids": list(_subscribed_tokens),
+                "type": "market",
+            }))
+            log.info(
+                f"Polymarket WS: souscription etendue (+{len(new_tokens)} tokens, "
+                f"{len(_subscribed_tokens)} au total, sans reconnexion)"
+            )
+        except Exception as e:
+            log.warning(
+                f"Polymarket WS: envoi souscription sur connexion existante echoue ({e}) — "
+                "reconnexion au prochain cycle reprendra les tokens"
+            )
 
 
 async def _handle_price_change(event: dict) -> None:
-    """
-    price_change — chaque changement de bid/ask.
-    C'est l'event le plus fréquent — sub-seconde.
-    On le stocke comme un tick orderbook.
-    """
     token_id  = event.get("asset_id", "")
     market_id = _token_to_market.get(token_id, "")
     outcome   = _token_to_outcome.get(token_id, "")
@@ -79,7 +156,6 @@ async def _handle_price_change(event: dict) -> None:
     expiry_ms = _market_to_expiry.get(market_id, 0)
     tte_ms    = max(0, expiry_ms - now_ms)
 
-    # Extrait bid/ask depuis price_changes[]
     changes = event.get("price_changes") or [event]
     for change in changes:
         bid = float(change.get("best_bid") or change.get("price") or 0)
@@ -87,8 +163,6 @@ async def _handle_price_change(event: dict) -> None:
 
         if bid <= 0 and ask <= 0:
             continue
-
-        # Si on a seulement l'un des deux, utilise le dernier connu
         if bid <= 0:
             bid = _last_bid.get(market_id, 0)
         if ask <= 0:
@@ -97,20 +171,27 @@ async def _handle_price_change(event: dict) -> None:
         mid    = (bid + ask) / 2 if (bid + ask) > 0 else 0
         spread = ask - bid if ask > bid else 0
 
-        # Delta depuis dernier mid
-        prev_mid  = _last_mid.get(market_id, mid)
-        delta_1s  = mid - prev_mid
+        prev_mid   = _last_mid.get(market_id, mid)
+        delta_tick = mid - prev_mid
 
         _last_bid[market_id] = bid
         _last_ask[market_id] = ask
         _last_mid[market_id] = mid
+
+        vol_cum      = _volume_cumul.get(market_id, 0.0)
+        n_trades     = _trade_count.get(market_id, 0)
+        delta_10     = _mid_delta_10_ticks(market_id, mid)
+        btc_hz       = get_btc_horizon_fields(market_id, now_ms)
+        im           = get_inter_market_fields(market_id)
+        spread_ma    = _update_spread_ma(market_id, spread)
+        # Sur price_change, liquidite totale = 0 (non fournie) — MA calculee sur les book events
+        liq_ma       = _update_liq_ma(market_id, 0.0, 0.0)
 
         row = {
             "tick_id":               next_tick_id(),
             "market_id":             market_id,
             "captured_ts_ms":        now_ms,
             "time_to_expiry_ms":     tte_ms,
-            # YES
             "yes_best_bid":          bid,
             "yes_best_ask":          ask,
             "yes_bid_size":          float(change.get("bid_size", 0)),
@@ -118,44 +199,42 @@ async def _handle_price_change(event: dict) -> None:
             "yes_total_bid_liq":     0.0,
             "yes_total_ask_liq":     0.0,
             "yes_book_depth":        0,
-            # NO (complémentaire)
             "no_best_bid":           round(1 - ask, 4) if ask else 0,
             "no_best_ask":           round(1 - bid, 4) if bid else 0,
             "no_bid_size":           float(change.get("ask_size", 0)),
             "no_ask_size":           float(change.get("bid_size", 0)),
             "no_total_bid_liq":      0.0,
             "no_total_ask_liq":      0.0,
-            # Dérivés
             "yes_mid":               mid,
             "yes_spread":            spread,
             "yes_spread_pct":        (spread / mid * 100) if mid > 0 else 0,
             "book_imbalance":        0.0,
-            "yes_price_delta_1s":    delta_1s,
-            "yes_price_delta_10s":   0.0,
-            "volume_since_open":     0.0,
-            "trade_count_since_open": 0,
+            "yes_price_delta_tick":  delta_tick,
+            "yes_price_delta_10s":   delta_10,
+            "volume_since_open":     vol_cum,
+            "trade_count_since_open": n_trades,
             "btc_spot":              btc_spot,
-            "moneyness": btc_spot - btc_open if btc_open else 0.0,
+            "moneyness":             btc_spot - btc_open if btc_open else 0.0,
+            "yes_spread_ma_60":      spread_ma,
+            "yes_liq_ma_60":         liq_ma,
+            **btc_hz,
+            **im,
         }
         await push("orderbook_ticks", row)
 
 
 async def _handle_book(event: dict) -> None:
-    """
-    book — snapshot complet du carnet après chaque modification.
-    Contient bids[] et asks[] complets avec tous les niveaux.
-    """
     token_id  = event.get("asset_id", "")
     market_id = _token_to_market.get(token_id, "")
     outcome   = _token_to_outcome.get(token_id, "")
     if not market_id or outcome != "YES":
         return
 
-    now_ms   = int(time.time() * 1000)
+    now_ms    = int(time.time() * 1000)
     btc_spot  = get_btc_spot()
     btc_open  = _market_to_btc_open.get(market_id, 0.0)
     expiry_ms = _market_to_expiry.get(market_id, 0)
-    tte_ms   = max(0, expiry_ms - now_ms)
+    tte_ms    = max(0, expiry_ms - now_ms)
 
     bids = sorted(event.get("bids", []),
                   key=lambda x: float(x[0] if isinstance(x, list) else x.get("price", 0)),
@@ -177,12 +256,20 @@ async def _handle_book(event: dict) -> None:
     imbalance     = ((total_bid_liq - total_ask_liq) / (total_bid_liq + total_ask_liq)
                      if (total_bid_liq + total_ask_liq) > 0 else 0)
 
-    prev_mid  = _last_mid.get(market_id, mid)
-    delta_1s  = mid - prev_mid
+    prev_mid   = _last_mid.get(market_id, mid)
+    delta_tick = mid - prev_mid
 
     _last_bid[market_id] = best_bid
     _last_ask[market_id] = best_ask
     _last_mid[market_id] = mid
+
+    vol_cum   = _volume_cumul.get(market_id, 0.0)
+    n_trades  = _trade_count.get(market_id, 0)
+    delta_10  = _mid_delta_10_ticks(market_id, mid)
+    btc_hz    = get_btc_horizon_fields(market_id, now_ms)
+    im        = get_inter_market_fields(market_id)
+    spread_ma = _update_spread_ma(market_id, spread)
+    liq_ma    = _update_liq_ma(market_id, total_bid_liq, total_ask_liq)
 
     row = {
         "tick_id":               next_tick_id(),
@@ -206,12 +293,16 @@ async def _handle_book(event: dict) -> None:
         "yes_spread":            spread,
         "yes_spread_pct":        (spread / mid * 100) if mid > 0 else 0,
         "book_imbalance":        imbalance,
-        "yes_price_delta_1s":    delta_1s,
-        "yes_price_delta_10s":   0.0,
-        "volume_since_open":     0.0,
-        "trade_count_since_open": 0,
+        "yes_price_delta_tick":  delta_tick,
+        "yes_price_delta_10s":   delta_10,
+        "volume_since_open":     vol_cum,
+        "trade_count_since_open": n_trades,
         "btc_spot":              btc_spot,
         "moneyness":             btc_spot - btc_open if btc_open else 0.0,
+        "yes_spread_ma_60":      spread_ma,
+        "yes_liq_ma_60":         liq_ma,
+        **btc_hz,
+        **im,
     }
     await push("orderbook_ticks", row)
 
@@ -234,6 +325,8 @@ async def _handle_last_trade(event: dict) -> None:
     tte_ms    = max(0, expiry_ms - ts_ms)
     mid       = _last_mid.get(market_id, price)
     slippage  = price - mid if mid else 0.0
+    btc_hz    = get_btc_horizon_fields(market_id, ts_ms)
+    im        = get_inter_market_fields(market_id)
 
     await push("trades", {
         "trade_id":                   trade_id,
@@ -250,9 +343,12 @@ async def _handle_last_trade(event: dict) -> None:
         "btc_spot_at_trade":          btc_spot,
         "moneyness_at_trade":         btc_spot - _market_to_btc_open.get(market_id, 0.0),
         "slippage_vs_mid":            slippage,
+        "yes_best_bid_at_trade":      _last_bid.get(market_id, 0.0),
+        "yes_best_ask_at_trade":      _last_ask.get(market_id, 0.0),
+        **btc_hz,
+        **im,
     })
 
-    # Met à jour les compteurs dans le state local
     _trade_count[market_id] = _trade_count.get(market_id, 0) + 1
     _volume_cumul[market_id] = _volume_cumul.get(market_id, 0.0) + size
 
@@ -268,7 +364,7 @@ async def polymarket_ws_loop() -> None:
                 POLYMARKET_WS_URL, ping_interval=30, ping_timeout=15,
             ) as ws:
                 _ws_ref = ws
-                log.info("Polymarket WS: connecté")
+                log.info("Polymarket WS: connecte")
                 backoff = 1
 
                 if _subscribed_tokens:
@@ -293,7 +389,7 @@ async def polymarket_ws_loop() -> None:
                             elif etype in ("last_trade_price", "trade"):
                                 await _handle_last_trade(event)
                     except Exception as e:
-                        log.warning(f"Polymarket WS parse error: {e}")
+                        log.debug(f"Polymarket WS: message ignore ({e})")
 
         except Exception as e:
             log.warning(f"Polymarket WS disconnected: {e} — reconnexion dans {backoff}s")
