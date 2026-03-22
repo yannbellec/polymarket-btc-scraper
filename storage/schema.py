@@ -11,24 +11,18 @@ DB_PATH = "data/btc_scraper.duckdb"
 def init_schema(con: duckdb.DuckDBPyConnection) -> None:
     log.info("Initialisation du schéma DuckDB...")
 
-    # ── 1. btc_markets ─────────────────────────────────────────────────────────
     con.execute("""
         CREATE TABLE IF NOT EXISTS btc_markets (
-            -- Identifiants
             market_id               TEXT PRIMARY KEY,
             condition_id            TEXT,
             token_id_yes            TEXT,
             token_id_no             TEXT,
-
-            -- Caractéristiques du contrat
             question                TEXT,
             window_ts               BIGINT,
             expiry_ts_ms            BIGINT,
             expiry_iso              TEXT,
             window_minutes          INTEGER,
             open_ts_ms              BIGINT,
-
-            -- Volume et liquidité à l'ouverture
             initial_volume          DOUBLE,
             initial_liquidity       DOUBLE,
             initial_price_yes       DOUBLE,
@@ -37,16 +31,11 @@ def init_schema(con: duckdb.DuckDBPyConnection) -> None:
             taker_fee               DOUBLE,
             min_order_size          DOUBLE,
             min_tick_size           DOUBLE,
-
-            -- Dérivés calculés à la découverte
             btc_spot_at_open        DOUBLE,
-            price_to_beat           DOUBLE,
             price_to_beat           DOUBLE,
             moneyness_at_open       DOUBLE,
             moneyness_pct_at_open   DOUBLE,
             seconds_to_expiry_at_open INTEGER,
-
-            -- Statut final (mis à jour post-expiry)
             resolved                BOOLEAN DEFAULT FALSE,
             winning_outcome         TEXT,
             final_btc_price         DOUBLE,
@@ -54,16 +43,12 @@ def init_schema(con: duckdb.DuckDBPyConnection) -> None:
         )
     """)
 
-    # ── 2. orderbook_ticks ─────────────────────────────────────────────────────
     con.execute("""
         CREATE TABLE IF NOT EXISTS orderbook_ticks (
-            -- Clés
             tick_id                 BIGINT,
             market_id               TEXT,
             captured_ts_ms          BIGINT,
             time_to_expiry_ms       BIGINT,
-
-            -- Order book YES
             yes_best_bid            DOUBLE,
             yes_best_ask            DOUBLE,
             yes_bid_size            DOUBLE,
@@ -71,16 +56,12 @@ def init_schema(con: duckdb.DuckDBPyConnection) -> None:
             yes_total_bid_liq       DOUBLE,
             yes_total_ask_liq       DOUBLE,
             yes_book_depth          INTEGER,
-
-            -- Order book NO
             no_best_bid             DOUBLE,
             no_best_ask             DOUBLE,
             no_bid_size             DOUBLE,
             no_ask_size             DOUBLE,
             no_total_bid_liq        DOUBLE,
             no_total_ask_liq        DOUBLE,
-
-            -- Dérivés calculés au tick
             yes_mid                 DOUBLE,
             yes_spread              DOUBLE,
             yes_spread_pct          DOUBLE,
@@ -94,24 +75,18 @@ def init_schema(con: duckdb.DuckDBPyConnection) -> None:
         )
     """)
 
-    # ── 3. trades ──────────────────────────────────────────────────────────────
     con.execute("""
         CREATE TABLE IF NOT EXISTS trades (
-            -- Identifiants
             trade_id                TEXT PRIMARY KEY,
             market_id               TEXT,
             token_id                TEXT,
             outcome                 TEXT,
-
-            -- Données du trade
             price                   DOUBLE,
             size                    DOUBLE,
             side                    TEXT,
             trade_ts_ms             BIGINT,
             fee_rate_bps            DOUBLE,
             trade_type              TEXT,
-
-            -- Dérivés calculés au trade
             time_to_expiry_at_trade_ms BIGINT,
             btc_spot_at_trade       DOUBLE,
             moneyness_at_trade      DOUBLE,
@@ -119,7 +94,6 @@ def init_schema(con: duckdb.DuckDBPyConnection) -> None:
         )
     """)
 
-    # ── 4. btc_spot_ticks ──────────────────────────────────────────────────────
     con.execute("""
         CREATE TABLE IF NOT EXISTS btc_spot_ticks (
             ts_ms               BIGINT PRIMARY KEY,
@@ -130,26 +104,20 @@ def init_schema(con: duckdb.DuckDBPyConnection) -> None:
             binance_trade_id    BIGINT,
             qty                 DOUBLE,
             buyer_maker         BOOLEAN,
-
-            -- Dérivés
             price_delta_1s      DOUBLE,
             price_delta_30s     DOUBLE,
             volatility_1min     DOUBLE
         )
     """)
 
-    # ── 5. market_snapshots ────────────────────────────────────────────────────
     con.execute("""
         CREATE TABLE IF NOT EXISTS market_snapshots (
-            -- Résumé de vie du marché
             market_id               TEXT PRIMARY KEY,
             total_duration_sec      INTEGER,
             total_ticks             INTEGER,
             total_trades            INTEGER,
             total_volume_usdc       DOUBLE,
             winning_outcome         TEXT,
-
-            -- Trajectoire du prix YES
             open_price_yes          DOUBLE,
             close_price_yes         DOUBLE,
             min_price_yes           DOUBLE,
@@ -157,15 +125,11 @@ def init_schema(con: duckdb.DuckDBPyConnection) -> None:
             price_std_yes           DOUBLE,
             price_at_1min           DOUBLE,
             price_at_30s            DOUBLE,
-
-            -- Contexte BTC sur la fenêtre
             btc_open                DOUBLE,
             btc_close               DOUBLE,
             btc_move_pct            DOUBLE,
             btc_volatility          DOUBLE,
             final_moneyness         DOUBLE,
-
-            -- Timestamp du snapshot
             snapshot_ts_ms          BIGINT
         )
     """)

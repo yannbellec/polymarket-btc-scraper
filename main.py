@@ -1,13 +1,5 @@
 """
 Point d'entrée principal — BTC Polymarket Scraper.
-Architecture :
-  rtds (Binance+Chainlink) → prix BTC temps réel
-  discoverer               → marchés BTC 5-min
-  polymarket_ws            → book + trades temps réel
-  flush_loop               → buffer → DuckDB toutes les 60s
-  upload_loop              → DuckDB → Parquet horodaté → R2 toutes les 5 min
-  expiry_watcher           → snapshots à l'expiry
-  status_loop              → monitoring toutes les 60s
 """
 import asyncio
 import os
@@ -41,10 +33,14 @@ async def expiry_watcher_loop() -> None:
             if 0 < now_ms - market.expiry_ts_ms < 15_000 and market_id not in triggered:
                 triggered.add(market_id)
                 log.info(f"Expiry détectée: {market.question[:50]}")
-                await asyncio.sleep(5)
+                # Double flush pour garantir que tous les buffers sont en DuckDB
+                await asyncio.sleep(3)
                 await flush_all()
+                await asyncio.sleep(1)
+                await flush_all()
+                # Build snapshot depuis DuckDB
                 await build_snapshot(market_id, market_obj=market, winning_outcome=None)
-                # Export immédiat du snapshot vers R2
+                # Export immédiat vers R2
                 await flush_all()
                 paths = await export_incremental()
                 for path in paths:

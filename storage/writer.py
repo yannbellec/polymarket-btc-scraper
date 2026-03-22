@@ -16,7 +16,6 @@ from monitoring.logger import log
 from config.settings import FLUSH_INTERVAL_SEC
 from storage.schema import get_connection, DB_PATH
 
-# ── Tables et colonnes de timestamp pour l'export incrémental ────────────────
 TABLES = ["btc_markets", "orderbook_ticks", "trades", "btc_spot_ticks", "market_snapshots"]
 
 TIMESTAMP_COLS = {
@@ -27,15 +26,10 @@ TIMESTAMP_COLS = {
     "market_snapshots": "snapshot_ts_ms",
 }
 
-# ── Buffers mémoire ───────────────────────────────────────────────────────────
 _buffers: dict[str, list[dict]] = {t: [] for t in TABLES}
-_lock = asyncio.Lock()
+_lock    = asyncio.Lock()
 _con: duckdb.DuckDBPyConnection | None = None
-
-# ── Watermarks — dernière valeur de timestamp exportée par table ──────────────
 _watermarks: dict[str, int] = {t: 0 for t in TABLES}
-
-# ── Compteur tick_id ──────────────────────────────────────────────────────────
 _tick_counter = 0
 
 
@@ -58,7 +52,6 @@ async def push(table: str, row: dict) -> None:
 
 
 async def flush_all() -> int:
-    """Vide les buffers vers DuckDB. Retourne le nombre de lignes écrites."""
     async with _lock:
         total = 0
         con   = _get_con()
@@ -76,7 +69,7 @@ async def flush_all() -> int:
 
 
 def _insert_rows(con: duckdb.DuckDBPyConnection, table: str, rows: list[dict]) -> None:
-    df       = pd.DataFrame(rows)
+    df        = pd.DataFrame(rows)
     pk_tables = {"btc_markets", "trades", "btc_spot_ticks", "market_snapshots"}
 
     # Réordonne les colonnes selon le schéma DuckDB
@@ -91,25 +84,25 @@ def _insert_rows(con: duckdb.DuckDBPyConnection, table: str, rows: list[dict]) -
         pass
 
     if table in pk_tables:
+        # DuckDB utilise ON CONFLICT DO NOTHING (pas INSERT OR IGNORE)
         try:
-            con.execute(f"INSERT OR IGNORE INTO {table} SELECT * FROM df")
-        except Exception:
+            con.execute(f"INSERT INTO {table} SELECT * FROM df ON CONFLICT DO NOTHING")
+        except Exception as e:
+            log.debug(f"Batch insert failed [{table}], fallback ligne par ligne: {e}")
+            inserted = 0
             for _, row in df.iterrows():
                 try:
                     rdf = pd.DataFrame([row])
-                    con.execute(f"INSERT OR IGNORE INTO {table} SELECT * FROM rdf")
-                except Exception:
-                    pass
+                    con.execute(f"INSERT INTO {table} SELECT * FROM rdf ON CONFLICT DO NOTHING")
+                    inserted += 1
+                except Exception as e2:
+                    log.debug(f"Insert skip [{table}]: {e2}")
+            log.debug(f"{table}: {inserted}/{len(df)} lignes insérées")
     else:
         con.execute(f"INSERT INTO {table} SELECT * FROM df")
 
 
 async def export_incremental() -> list[str]:
-    """
-    Exporte UNIQUEMENT les nouvelles lignes depuis le dernier export.
-    Chaque appel crée un nouveau fichier Parquet horodaté.
-    Ne modifie jamais les fichiers existants.
-    """
     now      = datetime.now(timezone.utc)
     date_str = now.strftime("%Y-%m-%d")
     ts_str   = now.strftime("%H%M%S")
@@ -121,7 +114,6 @@ async def export_incremental() -> list[str]:
         watermark = _watermarks[table]
 
         try:
-            # Si watermark=0, exporte toute la table sans filtre temporel
             if watermark == 0:
                 count = con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
                 query = f"SELECT * FROM {table} ORDER BY {ts_col}"
@@ -140,7 +132,6 @@ async def export_incremental() -> list[str]:
 
             con.execute(f"COPY ({query}) TO '{path}' (FORMAT PARQUET, COMPRESSION ZSTD)")
 
-            # Met à jour le watermark
             new_watermark = con.execute(
                 f"SELECT MAX({ts_col}) FROM {table}"
             ).fetchone()[0]

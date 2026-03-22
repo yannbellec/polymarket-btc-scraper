@@ -1,6 +1,5 @@
 """
 Discoverer BTC 5-min — slug déterministe depuis l'horloge.
-Pas de scan Gamma API — on calcule directement le marché actif.
 slug = btc-updown-5m-{window_ts} où window_ts = now - (now % 300)
 """
 import asyncio
@@ -13,32 +12,38 @@ from config.settings import GAMMA_API_URL, DISCOVER_INTERVAL_SEC
 from monitoring.logger import log
 from storage.writer import push
 
+
 @dataclass
 class BtcMarket:
-    market_id:    str
-    condition_id: str
-    token_id_yes: str   # YES = UP
-    token_id_no:  str   # NO  = DOWN
-    question:     str
-    window_ts:    int   # timestamp Unix début fenêtre
-    expiry_ts_ms: int
-    open_ts_ms:   int
+    market_id:         str
+    condition_id:      str
+    token_id_yes:      str
+    token_id_no:       str
+    question:          str
+    window_ts:         int
+    expiry_ts_ms:      int
+    open_ts_ms:        int
     initial_volume:    float
     initial_liquidity: float
     initial_price_yes: float
     initial_price_no:  float
-    # Rempli à la découverte
     btc_spot_at_open:  float = 0.0
 
-_active_markets: dict[str, BtcMarket] = {}
-_on_new_market_callbacks: list = []
+
+_active_markets:       dict[str, BtcMarket] = {}
+_window_to_market:     dict[int, str]        = {}
+_on_new_market_callbacks: list               = []
+
+MARKET_PATTERNS = [("btc-updown-5m", 300)]
 
 
 def register_on_new_market(cb) -> None:
     _on_new_market_callbacks.append(cb)
 
+
 def get_active_markets() -> dict[str, BtcMarket]:
     return dict(_active_markets)
+
 
 def get_token_ids() -> list[str]:
     ids = []
@@ -47,20 +52,25 @@ def get_token_ids() -> list[str]:
         if m.token_id_no:  ids.append(m.token_id_no)
     return ids
 
+
 def current_window_ts() -> int:
     now = int(time.time())
     return now - (now % 300)
 
+
 def next_window_ts() -> int:
     return current_window_ts() + 300
+
 
 def make_slug(window_ts: int) -> str:
     return f"btc-updown-5m-{window_ts}"
 
 
+def market_id_for_window(window_ts: int) -> str | None:
+    return _window_to_market.get(window_ts)
+
+
 async def _fetch_market_by_slug(client: httpx.AsyncClient, slug: str) -> dict | None:
-    """Fetch un marché précis depuis la Gamma API via son slug."""
-    # Try /events endpoint first
     for endpoint, param in [
         (f"{GAMMA_API_URL}/events", "slug"),
         (f"{GAMMA_API_URL}/markets", "slug"),
@@ -80,207 +90,39 @@ async def _fetch_market_by_slug(client: httpx.AsyncClient, slug: str) -> dict | 
     return None
 
 
-def _extract_tokens(raw: dict) -> tuple[str, str]:
-    import json
-
-    markets = raw.get("markets", [])
-    if markets:
-        m = markets[0]
-        clob_ids_raw = m.get("clobTokenIds", "[]")
-        # clobTokenIds est une string JSON ex: '["abc123", "def456"]'
-        if isinstance(clob_ids_raw, str):
-            try:
-                clob_ids = json.loads(clob_ids_raw)
-            except Exception:
-                clob_ids = []
-        else:
-            clob_ids = clob_ids_raw
-
-        outcomes_raw = m.get("outcomes", '["Yes","No"]')
-        if isinstance(outcomes_raw, str):
-            try:
-                outcomes = json.loads(outcomes_raw)
-            except Exception:
-                outcomes = ["Yes", "No"]
-        else:
-            outcomes = outcomes_raw
-
-        yes_idx = next((i for i, o in enumerate(outcomes)
-                        if "yes" in str(o).lower() or "up" in str(o).lower()), 0)
-        no_idx = 1 - yes_idx if len(clob_ids) >= 2 else 1
-
-        yes_id = clob_ids[yes_idx] if yes_idx < len(clob_ids) else ""
-        no_id  = clob_ids[no_idx]  if no_idx  < len(clob_ids) else ""
-        return yes_id, no_id
-
-    # Format direct market avec tokens[]
-    tokens = raw.get("tokens", [])
-    yes_id, no_id = "", ""
-    for t in tokens:
-        outcome = t.get("outcome", "").lower()
-        if outcome in ("yes", "up"):
-            yes_id = t.get("token_id", "")
-        elif outcome in ("no", "down"):
-            no_id = t.get("token_id", "")
-    return yes_id, no_id
-
-
-def _extract_prices(raw: dict) -> tuple[float, float]:
-    markets = raw.get("markets", [])
-    if markets:
-        m = markets[0]
-        import json
-        prices_str = m.get("outcomePrices", '["0.5","0.5"]')
-        try:
-            prices = json.loads(prices_str)
-            return float(prices[0]), float(prices[1])
-        except Exception:
-            pass
-    tokens = raw.get("tokens", [])
-    for t in tokens:
-        if "up" in t.get("outcome","").lower() or "yes" in t.get("outcome","").lower():
-            return float(t.get("price", 0.5)), 1 - float(t.get("price", 0.5))
-    return 0.5, 0.5
-
-
-async def _try_discover(client: httpx.AsyncClient, window_ts: int, btc_spot_fn) -> bool:
-    """Tente de découvrir le marché pour ce window_ts. Retourne True si trouvé."""
-    if market_id_for_window(window_ts):
-        return True  # déjà connu
-
-    slug = make_slug(window_ts)
-    raw  = await _fetch_market_by_slug(client, slug)
-
-    if not raw:
-        log.debug(f"Marché non trouvé: {slug}")
-        return False
-
-    # Parse IDs
-    market_id    = raw.get("id") or raw.get("conditionId", slug)
-    condition_id = raw.get("conditionId", market_id)
-    yes_id, no_id = _extract_tokens(raw)
-    price_yes, price_no = _extract_prices(raw)
-
-    expiry_ts_ms = (window_ts + 300) * 1000
-    open_ts_ms   = window_ts * 1000
-    # Attend jusqu'à 3s pour avoir un prix BTC valide
-    btc_spot = btc_spot_fn()
-    if btc_spot == 0.0:
-        for _ in range(6):
-            await asyncio.sleep(0.5)
-            btc_spot = btc_spot_fn()
-            if btc_spot > 0:
-                break
-
-    market = BtcMarket(
-        market_id=market_id,
-        condition_id=condition_id,
-        token_id_yes=yes_id,
-        token_id_no=no_id,
-        question=raw.get("title") or raw.get("question") or slug,
-        window_ts=window_ts,
-        expiry_ts_ms=expiry_ts_ms,
-        open_ts_ms=open_ts_ms,
-        initial_volume=float(raw.get("volume", 0) or 0),
-        initial_liquidity=float(raw.get("liquidity", 0) or 0),
-        initial_price_yes=price_yes,
-        initial_price_no=price_no,
-        btc_spot_at_open=price_to_beat if price_to_beat else btc_spot,
-    )
-
-    _active_markets[market_id] = market
-    _window_to_market[window_ts] = market_id
-
-    await push("btc_markets", {
-        "market_id": market_id,
-        "condition_id": condition_id,
-        "token_id_yes": yes_id,
-        "token_id_no": no_id,
-        "question": market.question,
-        "window_ts": window_ts,
-        "expiry_ts_ms": expiry_ts_ms,
-        "expiry_iso": "",
-        "window_minutes": 5,
-        "open_ts_ms": open_ts_ms,
-        "price_to_beat": price_to_beat,
-        "initial_volume": market.initial_volume,
-        "initial_liquidity": market.initial_liquidity,
-        "initial_price_yes": price_yes,
-        "initial_price_no": price_no,
-        "maker_fee": 0.0, "taker_fee": 0.0,
-        "min_order_size": 5.0, "min_tick_size": 0.01,
-        "btc_spot_at_open": btc_spot,
-        "moneyness_at_open": 0.0,
-        "moneyness_pct_at_open": 0.0,
-        "seconds_to_expiry_at_open": max(0, (expiry_ts_ms // 1000) - int(time.time())),
-        "resolved": False,
-        "winning_outcome": None, "final_btc_price": None, "closed_ts_ms": None,
-    })
-
-    log.info(f"Nouveau marché: {slug} | YES={yes_id[:12]}... | prix={price_yes:.3f}/{price_no:.3f}")
-
-    for cb in _on_new_market_callbacks:
-        try:
-            await cb(market)
-        except Exception as e:
-            log.warning(f"on_new_market callback error: {e}")
-
-    return True
-
-
-_window_to_market: dict[int, str] = {}
-
-def market_id_for_window(window_ts: int) -> str | None:
-    return _window_to_market.get(window_ts)
-
-
-# Patterns de marchés à surveiller
-MARKET_PATTERNS = [
-    ("btc-updown-5m", 300),
-]
-
 async def _try_discover_slug(client, slug: str, window_ts: int,
                               window_sec: int, btc_spot_fn) -> bool:
-    """Découvre un marché par son slug exact."""
     import json as _json
 
-    # Déjà connu ?
     if any(m.window_ts == window_ts for m in _active_markets.values()):
         return True
 
-    # Fetch depuis la Gamma API
     raw = await _fetch_market_by_slug(client, slug)
     if not raw:
         return False
 
-    # raw est un event — le vrai marché est dans markets[0]
     markets_list = raw.get("markets", [])
     if not markets_list:
         return False
     market_data = markets_list[0]
 
-    # IDs corrects
     market_id    = str(market_data.get("id", slug))
     condition_id = market_data.get("conditionId", "")
 
-    # Tokens
     clob_ids_raw = market_data.get("clobTokenIds", "[]")
-    clob_ids = _json.loads(clob_ids_raw) if isinstance(clob_ids_raw, str) else clob_ids_raw
-    yes_id = clob_ids[0] if len(clob_ids) > 0 else ""
-    no_id  = clob_ids[1] if len(clob_ids) > 1 else ""
+    clob_ids     = _json.loads(clob_ids_raw) if isinstance(clob_ids_raw, str) else clob_ids_raw
+    yes_id       = clob_ids[0] if len(clob_ids) > 0 else ""
+    no_id        = clob_ids[1] if len(clob_ids) > 1 else ""
 
-    # Prix
     prices_raw = market_data.get("outcomePrices", "[0.5,0.5]")
-    prices = _json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
-    price_yes = float(prices[0]) if prices else 0.5
-    price_no  = float(prices[1]) if len(prices) > 1 else 0.5
+    prices     = _json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
+    price_yes  = float(prices[0]) if prices else 0.5
+    price_no   = float(prices[1]) if len(prices) > 1 else 0.5
 
-    # priceToBeat = prix BTC référence pour le settlement
     event_metadata = raw.get("eventMetadata") or {}
     if isinstance(event_metadata, str):
         try:
-            import json as _j
-            event_metadata = _j.loads(event_metadata)
+            event_metadata = _json.loads(event_metadata)
         except Exception:
             event_metadata = {}
     price_to_beat = float(event_metadata.get("priceToBeat", 0.0))
@@ -294,18 +136,23 @@ async def _try_discover_slug(client, slug: str, window_ts: int,
     open_ts_ms   = window_ts * 1000
 
     market = BtcMarket(
-        market_id=market_id, condition_id=condition_id,
-        token_id_yes=yes_id, token_id_no=no_id,
+        market_id=market_id,
+        condition_id=condition_id,
+        token_id_yes=yes_id,
+        token_id_no=no_id,
         question=raw.get("title") or market_data.get("question") or slug,
-        window_ts=window_ts, expiry_ts_ms=expiry_ts_ms, open_ts_ms=open_ts_ms,
+        window_ts=window_ts,
+        expiry_ts_ms=expiry_ts_ms,
+        open_ts_ms=open_ts_ms,
         initial_volume=float(market_data.get("volume", 0) or 0),
         initial_liquidity=float(market_data.get("liquidity", 0) or 0),
-        initial_price_yes=price_yes, initial_price_no=price_no,
+        initial_price_yes=price_yes,
+        initial_price_no=price_no,
         btc_spot_at_open=btc_open,
     )
 
-    _active_markets[market_id] = market
-    _window_to_market[window_ts] = market_id
+    _active_markets[market_id]    = market
+    _window_to_market[window_ts]  = market_id
 
     await push("btc_markets", {
         "market_id":                  market_id,
@@ -327,6 +174,7 @@ async def _try_discover_slug(client, slug: str, window_ts: int,
         "min_order_size":             float(market_data.get("orderMinSize", 5) or 5),
         "min_tick_size":              float(market_data.get("orderPriceMinTickSize", 0.01) or 0.01),
         "btc_spot_at_open":           btc_open,
+        "price_to_beat":              price_to_beat,
         "moneyness_at_open":          0.0,
         "moneyness_pct_at_open":      0.0,
         "seconds_to_expiry_at_open":  max(0, (expiry_ts_ms // 1000) - int(time.time())),
@@ -349,33 +197,29 @@ async def _try_discover_slug(client, slug: str, window_ts: int,
 
     return True
 
+
 async def discovery_loop(btc_spot_fn) -> None:
     log.info("Discoverer démarré (multi-pattern, poll toutes les 15s)")
     async with httpx.AsyncClient() as client:
         while True:
             try:
-                now = int(time.time())
+                now    = int(time.time())
                 now_ms = now * 1000
 
                 for prefix, window_sec in MARKET_PATTERNS:
                     wts  = now - (now % window_sec)
                     nwts = wts + window_sec
 
-                    # Marché courant
-                    await _try_discover_slug(client, f"{prefix}-{wts}", wts, window_sec, btc_spot_fn)
+                    await _try_discover_slug(client, f"{prefix}-{wts}",  wts,  window_sec, btc_spot_fn)
 
-                    # Marché suivant (pré-découverte 30s avant)
                     if (nwts - now) <= 30:
                         await _try_discover_slug(client, f"{prefix}-{nwts}", nwts, window_sec, btc_spot_fn)
 
-                # Purge expirés
                 expired = [mid for mid, m in _active_markets.items()
                            if m.expiry_ts_ms < now_ms - 10_000]
                 for mid in expired:
                     log.info(f"Expiré purgé: {_active_markets[mid].question[:50]}")
                     del _active_markets[mid]
-
-                log.debug(f"Discoverer: {len(_active_markets)} marchés actifs")
 
             except Exception as e:
                 log.error(f"Discovery error: {e}")
