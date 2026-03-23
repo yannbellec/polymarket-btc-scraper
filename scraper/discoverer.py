@@ -13,7 +13,6 @@ from config.settings import GAMMA_API_URL, DISCOVER_INTERVAL_SEC
 from monitoring.logger import log
 from storage.writer import push
 from scraper.inter_market_context import get_context_for_window
-from scraper.ws_polymarket import purge_market_ws_state
 
 
 @dataclass
@@ -314,15 +313,17 @@ async def discovery_loop(btc_spot_fn) -> None:
                     if (nwts - now) <= 30:
                         await _try_discover_slug(client, f"{prefix}-{nwts}", nwts, window_sec, btc_spot_fn)
 
-                # 60s après expiry : laisse le temps à expiry_watcher + snapshot avant retrait mémoire
-                expired = [mid for mid, m in _active_markets.items()
-                           if m.expiry_ts_ms < now_ms - 60_000]
+                # Après expiry_watcher (snapshot) : 60s, sinon repli 15 min
+                expired = [
+                    mid for mid, m in _active_markets.items()
+                    if (m.expiry_ts_ms < now_ms - 60_000 and mid in expiry_snapshot_triggered)
+                    or m.expiry_ts_ms < now_ms - 900_000
+                ]
                 for mid in expired:
                     log.info(f"Expiré purgé: {_active_markets[mid].question[:50]}")
                     wts = _active_markets[mid].window_ts
                     del _active_markets[mid]
                     _window_to_market.pop(wts, None)
-                    purge_market_ws_state(mid)
                 expiry_snapshot_triggered.difference_update(expired)
 
             except Exception as e:

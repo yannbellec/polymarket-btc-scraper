@@ -14,6 +14,7 @@ from scraper.ws_polymarket import (
     register_market,
     subscribe_tokens,
     get_polymarket_ws_health,
+    purge_market_ws_state,
 )
 from scraper.discoverer import (
     discovery_loop,
@@ -66,27 +67,49 @@ async def on_new_market(market) -> None:
     log.info(f"Marché enregistré: {market.question[:60]}")
 
 
+async def _handle_expiry(market_id: str, market) -> None:
+    """Gère une expiry dans une tâche isolée — ne bloque pas expiry_watcher_loop."""
+    try:
+        log.info(f"Expiry détectée: {market.question[:50]}")
+        # Laisse arriver les derniers events WS
+        await asyncio.sleep(5)
+        await flush_all()
+        await asyncio.sleep(2)
+        await flush_all()
+        # Build snapshot (peut prendre jusqu'à 10 min pour Gamma)
+        await build_snapshot(market_id, market_obj=market, winning_outcome=None)
+        # Export immédiat
+        await flush_all()
+        paths = await export_incremental()
+        for path in paths:
+            await upload_file(path)
+        # Purge WS seulement après que tout est terminé
+        purge_market_ws_state(market_id)
+        log.info(f"Expiry traitée et purgée: {market_id}")
+    except Exception as e:
+        log.error(f"_handle_expiry error [{market_id}]: {e}")
+        # Purge quand même pour éviter accumulation tokens
+        purge_market_ws_state(market_id)
+
+
 async def expiry_watcher_loop() -> None:
-    """Déclenche snapshot + export immédiat à chaque expiry."""
+    """Détecte les expiries et lance chaque traitement dans une tâche isolée."""
+    _in_flight: set[str] = set()
     while True:
         await asyncio.sleep(5)
         now_ms = int(time.time() * 1000)
         for market_id, market in list(get_active_markets().items()):
-            if 0 < now_ms - market.expiry_ts_ms < 15_000 and market_id not in expiry_snapshot_triggered:
+            if (0 < now_ms - market.expiry_ts_ms < 15_000
+                    and market_id not in expiry_snapshot_triggered
+                    and market_id not in _in_flight):
                 expiry_snapshot_triggered.add(market_id)
-                log.info(f"Expiry détectée: {market.question[:50]}")
-                # Laisser arriver les derniers événements WS (price_change / trades) puis vider les buffers
-                await asyncio.sleep(5)
-                await flush_all()
-                await asyncio.sleep(2)
-                await flush_all()
-                # build_snapshot refait des drains avant les agrégats DuckDB (voir snapshot_builder)
-                await build_snapshot(market_id, market_obj=market, winning_outcome=None)
-                # Export immédiat vers R2
-                await flush_all()
-                paths = await export_incremental()
-                for path in paths:
-                    await upload_file(path)
+                _in_flight.add(market_id)
+                task = asyncio.create_task(
+                    _handle_expiry(market_id, market),
+                    name=f"expiry_{market_id}"
+                )
+                # Retire de _in_flight quand la tâche se termine
+                task.add_done_callback(lambda t, mid=market_id: _in_flight.discard(mid))
 
 
 # Après connexion + souscription, alerte si toujours aucun flux orderbook/trades (WS muet).
