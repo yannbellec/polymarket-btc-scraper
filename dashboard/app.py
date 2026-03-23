@@ -212,6 +212,40 @@ def load_table_full(table: str, date: str) -> pd.DataFrame:
     return _read_parquet_keys(keys)
 
 
+@st.cache_data(ttl=60)
+def count_rows_full(table: str, date: str) -> int:
+    """
+    Compte le nombre de lignes sur tous les parquet d'une table/date.
+
+    Objectif: garder les métriques globales à jour sans charger les données complètes en RAM.
+    """
+    keys = _load_parquet_keys(table, date)
+    if not keys:
+        return 0
+
+    con = duckdb.connect()
+    total = 0
+    s3 = get_s3()
+    for key in keys:
+        buf = io.BytesIO()
+        s3.download_fileobj(BUCKET, key, buf)
+        buf.seek(0)
+
+        # Même convention que `_read_parquet_keys` pour rester compatible avec l'environnement.
+        tmp = f"/tmp/{key.replace('/', '_')}"
+        with open(tmp, "wb") as f:
+            f.write(buf.read())
+
+        try:
+            c = con.execute(f"SELECT COUNT(*) AS c FROM read_parquet('{tmp}')").fetchone()[0]
+            total += int(c)
+        except Exception:
+            # Si un fichier parquet est corrompu/incompatible, on le skippe comme pour le chargement partiel.
+            pass
+    con.close()
+    return total
+
+
 def _heavy_table_header(table: str, date: str, df: pd.DataFrame, session_key: str) -> pd.DataFrame:
     """Affiche un bandeau preview + bouton 'Charger tout' pour les tables lourdes.
     Retourne le df complet si l'utilisateur clique, sinon df inchangé."""
@@ -277,11 +311,15 @@ with st.sidebar:
 st.markdown(f"## Data Inspector &nbsp;·&nbsp; <span style='color:#38bdf8'>{selected_date}</span>", unsafe_allow_html=True)
 
 # ─── Métriques globales ──────────────────────────────────────────────────────
-with st.spinner("Chargement des métriques..."):
+with st.spinner("Calcul des métriques globales (scan counts)..."):
     metrics = {}
     for t in TABLES:
-        df = load_table(t, selected_date)
-        metrics[t] = len(df)
+        # Tables lourdes: ne pas se baser sur le preview en RAM, mais compter sur tous les fichiers.
+        if t in HEAVY_TABLES:
+            metrics[t] = count_rows_full(t, selected_date)
+        else:
+            df = load_table(t, selected_date)
+            metrics[t] = len(df)
 
 col1, col2, col3, col4, col5, col6 = st.columns(6)
 cols = [col1, col2, col3, col4, col5, col6]
