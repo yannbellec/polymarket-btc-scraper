@@ -1,5 +1,10 @@
 """
 Construit les market_snapshots quand un marché expire.
+
+Les agrégats lisent DuckDB : tout ce qui est encore dans les buffers writer
+donne ticks=0 / trades=0. On force donc plusieurs flush avant les SELECT,
+notamment après l’attente Gamma (longue) où des derniers événements WS peuvent
+encore arriver.
 """
 import asyncio
 import json
@@ -8,17 +13,57 @@ import time
 import httpx
 
 from monitoring.logger import log
-from storage.writer import push
+from storage.writer import push, flush_all
 from storage.schema import get_connection as _get_con
-from scraper.ws_rtds import get_btc_spot
+from scraper.ws_rtds import get_btc_spot, btc_price_for_horizon
 from scraper.inter_market_context import record_completion
 
+# Après expiry, derniers price_change / trades peuvent encore arriver ; pause courte + flush répété.
+SNAPSHOT_DRAIN_INITIAL_SEC = 0.5
+SNAPSHOT_DRAIN_SETTLE_SEC = 2.0
+SNAPSHOT_DRAIN_FINAL_SEC = 0.5
 
-async def _fetch_winning_outcome(market_id: str, max_retries: int = 20) -> str | None:
+
+async def _drain_buffers_to_duckdb() -> None:
+    """Mémoire writer → DuckDB (toutes tables), en deux passes pour limiter la course."""
+    await flush_all()
+    await asyncio.sleep(SNAPSHOT_DRAIN_INITIAL_SEC)
+    await flush_all()
+
+
+def _parse_iso_to_ms(iso: str | None) -> int | None:
+    if not iso or not isinstance(iso, str):
+        return None
+    try:
+        s = iso.strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        from datetime import datetime
+
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return int(dt.timestamp() * 1000)
+    except Exception:
+        return None
+
+
+async def _drain_after_gamma_wait() -> None:
     """
-    Attend que le marché soit closed=True sur la Gamma API.
-    Le settlement on-chain est instantané mais la Gamma API met 2-5 min à se mettre à jour.
-    Retry toutes les 30s — max 10 minutes d'attente.
+    Après sleep(30) + fetch Gamma (potentiellement long), les buffers peuvent
+    contenir des ticks/trades tardifs. On vide avant les agrégats SQL.
+    """
+    await flush_all()
+    await asyncio.sleep(SNAPSHOT_DRAIN_SETTLE_SEC)
+    await flush_all()
+    await asyncio.sleep(SNAPSHOT_DRAIN_FINAL_SEC)
+    await flush_all()
+
+
+async def _fetch_winning_outcome(
+    market_id: str, max_retries: int = 20
+) -> tuple[str | None, int | None]:
+    """
+    Poll Gamma API jusqu'à ce qu'un outcome soit à ~1.0.
+    Retourne (outcome YES/NO/None, closed_ts_ms depuis endDate API si présent).
     """
     for attempt in range(max_retries):
         try:
@@ -46,15 +91,22 @@ async def _fetch_winning_outcome(market_id: str, max_retries: int = 20) -> str |
                 prices_raw = data.get("outcomePrices", "[0.5,0.5]")
                 prices = json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
 
+                end_hint = _parse_iso_to_ms(data.get("endDate")) or _parse_iso_to_ms(
+                    data.get("endDateIso")
+                )
+
                 # Cherche un outcome à 0.99 ou 1.0
                 for i, price in enumerate(prices):
                     if float(price) >= 0.99:
                         outcome = str(outcomes[i]).lower() if i < len(outcomes) else None
+                        out: str | None
                         if outcome in ("up", "yes"):
-                            return "YES"
+                            out = "YES"
                         elif outcome in ("down", "no"):
-                            return "NO"
-                        return str(outcomes[i]) if outcome else None
+                            out = "NO"
+                        else:
+                            out = str(outcomes[i]) if outcome else None
+                        return out, end_hint
 
                 log.debug(
                     f"Marché {market_id} pas encore résolu "
@@ -67,16 +119,68 @@ async def _fetch_winning_outcome(market_id: str, max_retries: int = 20) -> str |
         await asyncio.sleep(30)
 
     log.warning(f"Marché {market_id} non résolu après {max_retries * 30}s")
-    return None
+    return None, None
+
+
+def _apply_btc_markets_resolution(
+    con,
+    market_id: str,
+    m: dict,
+    winning_outcome: str | None,
+    gamma_closed_ts_ms: int | None,
+    btc_close_snapshot: float,
+) -> None:
+    """
+    Met à jour btc_markets après résolution (API Gamma + prix BTC de référence).
+    resolution_ts_ms sert au watermark export Parquet (ligne ré-émise après UPDATE).
+    """
+    expiry_ms = int(m.get("expiry_ts_ms") or 0)
+    final_btc = btc_price_for_horizon(expiry_ms) if expiry_ms else None
+    if final_btc is None or final_btc <= 0:
+        final_btc = float(btc_close_snapshot)
+
+    closed_ts = gamma_closed_ts_ms if gamma_closed_ts_ms else expiry_ms
+    if not closed_ts:
+        closed_ts = int(time.time() * 1000)
+
+    now_ms = int(time.time() * 1000)
+    resolved = winning_outcome is not None
+
+    con.execute(
+        """
+        UPDATE btc_markets SET
+            resolved = ?,
+            winning_outcome = ?,
+            final_btc_price = ?,
+            closed_ts_ms = ?,
+            resolution_ts_ms = ?
+        WHERE market_id = ?
+        """,
+        [resolved, winning_outcome, final_btc, closed_ts, now_ms, market_id],
+    )
+    log.info(
+        f"btc_markets résolution persistée: {market_id} | resolved={resolved} | "
+        f"outcome={winning_outcome} | final_btc={final_btc:.2f} | "
+        f"closed_ts_ms={closed_ts} | resolution_ts_ms={now_ms}"
+    )
 
 
 async def build_snapshot(market_id: str, market_obj=None, winning_outcome: str | None = None) -> None:
     try:
-        # Attend 10s pour que le marché soit résolu sur la Gamma API
+        # Tout ce qui est déjà en RAM (flush intervalle 60s) doit être en DuckDB avant agrégats
+        await _drain_buffers_to_duckdb()
+
+        # Attente côté Gamma (résolution API) — pendant ce temps le WS peut encore pousser des lignes
+        gamma_closed_ms: int | None = None
         if winning_outcome is None:
             await asyncio.sleep(30)
-            winning_outcome = await _fetch_winning_outcome(market_id)
+            winning_outcome, gamma_closed_ms = await _fetch_winning_outcome(market_id)
             log.info(f"Outcome résolu: {market_id} → {winning_outcome}")
+        else:
+            log.info(f"Outcome fourni pour snapshot: {market_id} → {winning_outcome}")
+
+        # Avant COUNT/MIN/MAX : vider à nouveau (sinon snapshot « vide » alors que les données existent en buffer)
+        await _drain_after_gamma_wait()
 
         con = _get_con()
         ts_ms     = int(time.time() * 1000)
@@ -99,6 +203,11 @@ async def build_snapshot(market_id: str, market_obj=None, winning_outcome: str |
                 return
             cols = [d[0] for d in con.description]
             m = dict(zip(cols, market_row))
+
+        # Mise à jour explicite btc_markets (résolution Gamma + BTC à l’expiry)
+        _apply_btc_markets_resolution(
+            con, market_id, m, winning_outcome, gamma_closed_ms, btc_close
+        )
 
         expiry_ms    = m.get("expiry_ts_ms", 0)
         open_ms      = m.get("open_ts_ms", ts_ms)
@@ -206,6 +315,13 @@ async def build_snapshot(market_id: str, market_obj=None, winning_outcome: str |
             f"ticks={total_ticks} | trades={total_trades_n} | "
             f"vol={total_volume:.0f} USDC | BTC move={btc_move:+.2f}%"
         )
+
+        if total_ticks == 0 and total_trades_n == 0:
+            log.warning(
+                f"Snapshot sans activité orderbook/trades pour {market_id} — "
+                "souvent causé par WS Polymarket coupé avant la fin de marché ou absence de flush "
+                "avant agrégation ; vérifier les logs WS et les drains flush."
+            )
 
     except Exception as e:
         log.error(f"build_snapshot error [{market_id}]: {e}")

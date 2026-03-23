@@ -77,6 +77,84 @@ def market_id_for_window(window_ts: int) -> str | None:
     return _window_to_market.get(window_ts)
 
 
+def _parse_event_metadata(raw: dict) -> dict:
+    """eventMetadata peut être un dict ou une chaîne JSON."""
+    import json as _json
+
+    em = raw.get("eventMetadata") or {}
+    if isinstance(em, str):
+        try:
+            em = _json.loads(em)
+        except Exception:
+            em = {}
+    return em if isinstance(em, dict) else {}
+
+
+def _to_positive_float(v) -> float:
+    try:
+        p = float(v)
+        return p if p > 0 else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _extract_gamma_price_to_beat(raw: dict, market_data: dict) -> float:
+    """
+    Prix de référence (strike) pour BTC Up/Down — champs variables selon la réponse Gamma.
+    """
+    em = _parse_event_metadata(raw)
+    for src in (em, market_data, raw):
+        if not isinstance(src, dict):
+            continue
+        for key in ("priceToBeat", "price_to_beat", "line", "strike", "strikePrice"):
+            p = _to_positive_float(src.get(key))
+            if p:
+                return p
+    # Parfois imbriqué sous "custom" / "metadata"
+    for parent_key in ("metadata", "custom", "settings"):
+        sub = raw.get(parent_key) or market_data.get(parent_key)
+        if isinstance(sub, dict):
+            for key in ("priceToBeat", "line", "strikePrice"):
+                p = _to_positive_float(sub.get(key))
+                if p:
+                    return p
+    return 0.0
+
+
+async def _resolve_btc_spot_with_fallback(
+    client: httpx.AsyncClient, btc_spot_fn, max_wait_rtds_sec: float = 12.0
+) -> float:
+    """
+    1) RTDS (Chainlink/Binance) — boucle courte si le scraper vient de démarrer.
+    2) HTTP Binance public (dernier recours, pas de clé API).
+    """
+    deadline = time.perf_counter() + max_wait_rtds_sec
+    while time.perf_counter() < deadline:
+        p = _to_positive_float(btc_spot_fn())
+        if p:
+            return p
+        await asyncio.sleep(0.5)
+
+    try:
+        resp = await client.get(
+            "https://api.binance.com/api/v3/ticker/price",
+            params={"symbol": "BTCUSDT"},
+            timeout=8,
+        )
+        resp.raise_for_status()
+        p = _to_positive_float(resp.json().get("price"))
+        if p:
+            log.info(
+                f"BTC spot: fallback HTTP Binance {p:.2f} USDT "
+                f"(RTDS pas encore prêt après {max_wait_rtds_sec:.0f}s)"
+            )
+            return p
+    except Exception as e:
+        log.warning(f"BTC spot fallback HTTP Binance échoué: {e}")
+
+    return 0.0
+
+
 async def _fetch_market_by_slug(client: httpx.AsyncClient, slug: str) -> dict | None:
     for endpoint, param in [
         (f"{GAMMA_API_URL}/events", "slug"),
@@ -126,19 +204,28 @@ async def _try_discover_slug(client, slug: str, window_ts: int,
     price_yes  = float(prices[0]) if prices else 0.5
     price_no   = float(prices[1]) if len(prices) > 1 else 0.5
 
-    event_metadata = raw.get("eventMetadata") or {}
-    if isinstance(event_metadata, str):
-        try:
-            event_metadata = _json.loads(event_metadata)
-        except Exception:
-            event_metadata = {}
-    price_to_beat = float(event_metadata.get("priceToBeat", 0.0))
-    if not price_to_beat:
-        price_to_beat = btc_spot_fn()
-        log.debug(f"priceToBeat absent — fallback BTC spot: {price_to_beat:.2f}")
+    event_metadata = _parse_event_metadata(raw)
 
-    btc_spot     = btc_spot_fn()
-    btc_open     = price_to_beat if price_to_beat else btc_spot
+    gamma_line = _extract_gamma_price_to_beat(raw, market_data)
+    spot_ref = await _resolve_btc_spot_with_fallback(client, btc_spot_fn)
+
+    if gamma_line > 0:
+        price_to_beat = gamma_line
+        btc_open = gamma_line
+        log.debug(f"priceToBeat Gamma: {price_to_beat:.2f}")
+    else:
+        price_to_beat = spot_ref
+        btc_open = spot_ref
+        if spot_ref > 0:
+            log.debug(
+                f"priceToBeat absent dans Gamma — strike = spot RTDS/HTTP: {spot_ref:.2f}"
+            )
+
+    if btc_open <= 0:
+        log.warning(
+            f"btc_spot_at_open / price_to_beat toujours à 0 pour slug={slug} — "
+            "RTDS et Binance HTTP indisponibles ; enrichissement impossible pour ce marché"
+        )
     expiry_ts_ms = (window_ts + window_sec) * 1000
     open_ts_ms   = window_ts * 1000
 
@@ -192,6 +279,7 @@ async def _try_discover_slug(client, slug: str, window_ts: int,
         "winning_outcome":            None,
         "final_btc_price":            None,
         "closed_ts_ms":               None,
+        "resolution_ts_ms":           None,
         **inter_ctx,
     })
 

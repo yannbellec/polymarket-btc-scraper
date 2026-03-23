@@ -18,7 +18,7 @@ from monitoring.logger import log
 from storage.writer import push, next_tick_id
 from scraper.ws_rtds import (
     get_btc_spot,
-    chainlink_price_at_or_after,
+    btc_price_for_horizon,
     get_chainlink_realized_vol_fields,
 )
 from scraper.inter_market_context import empty_inter_market_fields
@@ -57,6 +57,74 @@ _MA_LEN = 60
 _spread_ring: dict[str, deque] = {}
 _liq_ring: dict[str, deque] = {}
 
+# Télémétrie : preuve que le flux WS alimente orderbook/trades (depuis dernière connexion)
+_ws_telemetry: dict[str, Any] = {}
+_first_flow_logged = False
+
+
+def _reset_ws_telemetry() -> None:
+    global _ws_telemetry, _first_flow_logged
+    now = int(time.time() * 1000)
+    _ws_telemetry = {
+        "connect_ts_ms": now,
+        "raw_messages": 0,
+        "orderbook_push": 0,
+        "trade_push": 0,
+        "unknown_event_types": 0,
+        "last_activity_ts_ms": 0,
+        "last_activity_kind": None,
+    }
+    _first_flow_logged = False
+
+
+def _bump_flow_activity(kind: str) -> None:
+    global _first_flow_logged
+    _ws_telemetry["last_activity_ts_ms"] = int(time.time() * 1000)
+    _ws_telemetry["last_activity_kind"] = kind
+    if not _first_flow_logged:
+        _first_flow_logged = True
+        log.info(
+            f"Polymarket WS: premier flux reçu ({kind}) — données en file vers DuckDB"
+        )
+
+
+def _bump_orderbook_push() -> None:
+    _ws_telemetry["orderbook_push"] += 1
+    _bump_flow_activity("orderbook")
+
+
+def _bump_trade_push() -> None:
+    _ws_telemetry["trade_push"] += 1
+    _bump_flow_activity("trade")
+
+
+def get_polymarket_ws_health() -> dict[str, Any]:
+    """
+    Instantane pour logs / monitoring : connexion, tokens, volume depuis la derniere connexion WS.
+    Les compteurs orderbook_push / trade_push = lignes poussees vers le buffer (avant flush DuckDB).
+    """
+    now_ms = int(time.time() * 1000)
+    conn = _ws_ref is not None
+    last_ts = int(_ws_telemetry.get("last_activity_ts_ms") or 0)
+    age_sec = None if last_ts <= 0 else (now_ms - last_ts) / 1000.0
+    since_conn_sec = None
+    ct = int(_ws_telemetry.get("connect_ts_ms") or 0)
+    if ct > 0:
+        since_conn_sec = (now_ms - ct) / 1000.0
+    return {
+        "connected": conn,
+        "subscribed_tokens": len(_subscribed_tokens),
+        "connect_ts_ms": ct,
+        "seconds_since_connect": since_conn_sec,
+        "raw_ws_messages": int(_ws_telemetry.get("raw_messages") or 0),
+        "orderbook_rows_buffered": int(_ws_telemetry.get("orderbook_push") or 0),
+        "trade_rows_buffered": int(_ws_telemetry.get("trade_push") or 0),
+        "unknown_event_types": int(_ws_telemetry.get("unknown_event_types") or 0),
+        "last_activity_ts_ms": last_ts,
+        "last_activity_kind": _ws_telemetry.get("last_activity_kind"),
+        "seconds_since_last_activity": age_sec,
+    }
+
 
 def _horizon_state(market_id: str) -> Dict[str, Optional[float]]:
     return _btc_horizon_delta.setdefault(market_id, {"1": None, "2": None, "3": None})
@@ -80,7 +148,7 @@ def get_btc_horizon_fields(market_id: str, now_ms: int) -> Dict[str, Any]:
         if st[sk] is not None:
             out[col] = st[sk]
         elif now_ms >= open_ts + m * 60_000:
-            px = chainlink_price_at_or_after(open_ts + m * 60_000)
+            px = btc_price_for_horizon(open_ts + m * 60_000)
             if px is not None:
                 d = px - p0
                 st[sk] = d
@@ -299,6 +367,7 @@ async def _handle_price_change(event: dict) -> None:
             **im,
             **ofi,
         }
+        _bump_orderbook_push()
         await push("orderbook_ticks", row)
 
 
@@ -385,6 +454,7 @@ async def _handle_book(event: dict) -> None:
         **im,
         **ofi,
     }
+    _bump_orderbook_push()
     await push("orderbook_ticks", row)
 
 
@@ -410,6 +480,7 @@ async def _handle_last_trade(event: dict) -> None:
     btc_hz    = get_btc_horizon_fields(market_id, ts_ms)
     im        = get_inter_market_fields(market_id)
 
+    _bump_trade_push()
     await push("trades", {
         "trade_id":                   trade_id,
         "market_id":                  market_id,
@@ -448,6 +519,7 @@ async def polymarket_ws_loop() -> None:
                 _ws_ref = ws
                 log.info("Polymarket WS: connecte")
                 backoff = 1
+                _reset_ws_telemetry()
 
                 if _subscribed_tokens:
                     await ws.send(json.dumps({
@@ -458,6 +530,7 @@ async def polymarket_ws_loop() -> None:
 
                 async for raw in ws:
                     try:
+                        _ws_telemetry["raw_messages"] += 1
                         events = json.loads(raw)
                         if isinstance(events, dict):
                             events = [events]
@@ -470,6 +543,8 @@ async def polymarket_ws_loop() -> None:
                                 await _handle_book(event)
                             elif etype in ("last_trade_price", "trade"):
                                 await _handle_last_trade(event)
+                            else:
+                                _ws_telemetry["unknown_event_types"] += 1
                     except Exception as e:
                         log.debug(f"Polymarket WS: message ignore ({e})")
 

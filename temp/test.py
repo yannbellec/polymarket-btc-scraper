@@ -1,6 +1,11 @@
-import boto3
 import os
+import sys
+
+import boto3
 from dotenv import load_dotenv
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from storage.r2_list_utils import list_objects_v2_all
 
 load_dotenv()
 
@@ -34,8 +39,8 @@ try:
     )
     print("Client S3 cree OK")
 
-    resp = s3.list_objects_v2(Bucket=bucket)
-    print(f"Bucket accessible — {resp.get('KeyCount', 0)} objets existants")
+    n = len(list_objects_v2_all(s3, bucket))
+    print(f"Bucket accessible — {n} objets existants (liste paginée)")
 
     s3.put_object(Bucket=bucket, Key="test/ping.txt", Body=b"ok")
     print("Upload test OK")

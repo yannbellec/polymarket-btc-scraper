@@ -35,8 +35,11 @@ _chainlink_30s_buf: deque = deque(maxlen=30)
 _binance_history:   deque = deque(maxlen=60)
 _binance_30s_buf:   deque = deque(maxlen=30)
 
-# (ts_ms, price) Chainlink — pour horizons BTC depuis open_ts marché (~10 min)
-_chainlink_ticks: deque = deque(maxlen=600)
+# (ts_ms, price) — historique long pour deltas T+1/2/3 min vs open (éviction FIFO)
+_CHAINLINK_TICKS_MAX = 7200
+_BINANCE_TICKS_MAX = 7200
+_chainlink_ticks: deque = deque(maxlen=_CHAINLINK_TICKS_MAX)
+_binance_ticks: deque = deque(maxlen=_BINANCE_TICKS_MAX)
 
 
 def chainlink_price_at_or_after(target_ts_ms: int) -> Optional[float]:
@@ -44,6 +47,81 @@ def chainlink_price_at_or_after(target_ts_ms: int) -> Optional[float]:
     for t, p in _chainlink_ticks:
         if t >= target_ts_ms:
             return p
+    return None
+
+
+def chainlink_price_at_or_before(target_ts_ms: int) -> Optional[float]:
+    """Dernier tick Chainlink avec ts <= target_ts_ms (deque ordonnée par temps croissant)."""
+    last: Optional[float] = None
+    for t, p in _chainlink_ticks:
+        if t <= target_ts_ms:
+            last = p
+        else:
+            break
+    return last
+
+
+def _nearest_tick_price(ticks: deque, target_ts_ms: int, window_ms: int) -> Optional[float]:
+    """Tick dont le timestamp minimise |t - target| parmi ceux dans [target ± window]."""
+    best_p: Optional[float] = None
+    best_d: Optional[int] = None
+    for t, p in ticks:
+        d = abs(t - target_ts_ms)
+        if d > window_ms:
+            continue
+        if best_d is None or d < best_d:
+            best_d = d
+            best_p = p
+    return best_p
+
+
+def chainlink_price_for_horizon(target_ts_ms: int) -> Optional[float]:
+    """
+    Prix de référence Chainlink pour un instant cible (ex. open + 60s).
+
+    Ordre : premier tick >= T ; sinon dernier tick <= T (gap / tick rare) ;
+    sinon plus proche dans une fenêtre autour de T (RTDS irrégulier).
+    """
+    pa = chainlink_price_at_or_after(target_ts_ms)
+    if pa is not None:
+        return pa
+    pb = chainlink_price_at_or_before(target_ts_ms)
+    if pb is not None:
+        return pb
+    return _nearest_tick_price(_chainlink_ticks, target_ts_ms, window_ms=180_000)
+
+
+def _binance_price_for_horizon(target_ts_ms: int) -> Optional[float]:
+    """Même logique sur l'historique Binance RTDS (fallback si Chainlink insuffisant)."""
+    first_after: Optional[float] = None
+    for t, p in _binance_ticks:
+        if t >= target_ts_ms:
+            first_after = p
+            break
+    if first_after is not None:
+        return first_after
+    last_before: Optional[float] = None
+    for t, p in _binance_ticks:
+        if t <= target_ts_ms:
+            last_before = p
+        else:
+            break
+    if last_before is not None:
+        return last_before
+    return _nearest_tick_price(_binance_ticks, target_ts_ms, window_ms=180_000)
+
+
+def btc_price_for_horizon(target_ts_ms: int) -> Optional[float]:
+    """
+    Prix BTC pour un instant absolu : Chainlink prioritaire, Binance en secours.
+    Utilisé pour btc_delta_1min/2min/3min vs prix d'ouverture marché.
+    """
+    p = chainlink_price_for_horizon(target_ts_ms)
+    if p is not None and p > 0:
+        return p
+    p2 = _binance_price_for_horizon(target_ts_ms)
+    if p2 is not None and p2 > 0:
+        return p2
     return None
 
 
@@ -130,6 +208,7 @@ async def _handle_price(payload: dict, source: str) -> None:
 
     else:  # binance
         _state["price_binance"] = price
+        _binance_ticks.append((ts_ms, price))
         _binance_history.append(price)
         _binance_30s_buf.append(price)
 

@@ -1,5 +1,6 @@
 import sys, os, boto3, duckdb
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from storage.r2_list_utils import list_objects_v2_all
 from dotenv import load_dotenv
 from datetime import datetime, timezone
 load_dotenv()
@@ -15,9 +16,8 @@ bucket   = os.getenv("R2_BUCKET_NAME")
 date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 os.makedirs("temp/r2_check", exist_ok=True)
 
-# Liste tous les fichiers
-resp    = s3.list_objects_v2(Bucket=bucket)
-objects = resp.get("Contents", [])
+# Liste tous les fichiers (pagination si >1000 clés)
+objects = list_objects_v2_all(s3, bucket)
 print(f"=== {len(objects)} fichiers dans R2 ===")
 for obj in objects:
     print(f"  {obj['Key']:<65} {obj['Size']/1024:.1f} KB  {obj['LastModified'].strftime('%H:%M:%S')}")

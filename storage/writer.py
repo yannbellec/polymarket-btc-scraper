@@ -34,6 +34,13 @@ TIMESTAMP_COLS = {
     "market_snapshots":       "snapshot_ts_ms",
 }
 
+
+def _export_ts_expr(table: str) -> str:
+    """Expression temporelle pour export incrémental (btc_markets ré-exporté après résolution)."""
+    if table == "btc_markets":
+        return "COALESCE(resolution_ts_ms, open_ts_ms)"
+    return TIMESTAMP_COLS[table]
+
 _buffers: dict[str, list[dict]] = {t: [] for t in TABLES}
 _lock    = asyncio.Lock()
 _con: duckdb.DuckDBPyConnection | None = None
@@ -117,18 +124,18 @@ async def export_incremental() -> list[str]:
     paths    = []
 
     for table in TABLES:
-        ts_col    = TIMESTAMP_COLS[table]
+        ts_expr   = _export_ts_expr(table)
         watermark = _watermarks[table]
 
         try:
             if watermark == 0:
                 count = con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-                query = f"SELECT * FROM {table} ORDER BY {ts_col}"
+                query = f"SELECT * FROM {table} ORDER BY {ts_expr}"
             else:
                 count = con.execute(
-                    f"SELECT COUNT(*) FROM {table} WHERE {ts_col} > {watermark}"
+                    f"SELECT COUNT(*) FROM {table} WHERE {ts_expr} > {watermark}"
                 ).fetchone()[0]
-                query = f"SELECT * FROM {table} WHERE {ts_col} > {watermark} ORDER BY {ts_col}"
+                query = f"SELECT * FROM {table} WHERE {ts_expr} > {watermark} ORDER BY {ts_expr}"
 
             if count == 0:
                 continue
@@ -140,7 +147,7 @@ async def export_incremental() -> list[str]:
             con.execute(f"COPY ({query}) TO '{path}' (FORMAT PARQUET, COMPRESSION ZSTD)")
 
             new_watermark = con.execute(
-                f"SELECT MAX({ts_col}) FROM {table}"
+                f"SELECT MAX({ts_expr}) FROM {table}"
             ).fetchone()[0]
 
             if new_watermark:
@@ -169,3 +176,31 @@ async def flush_loop() -> None:
 
 def get_buffer_stats() -> dict:
     return {table: len(rows) for table, rows in _buffers.items()}
+
+
+def get_duckdb_row_counts() -> dict[str, int]:
+    """
+    Comptage des lignes persistées en DuckDB (après flush).
+    Utile pour valider que orderbook_ticks / trades ne sont pas vides avant export R2.
+    """
+    out: dict[str, int] = {}
+    try:
+        con = _get_con()
+        for table in TABLES:
+            try:
+                n = con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                out[table] = int(n)
+            except Exception as e:
+                log.debug(f"DuckDB COUNT {table}: {e}")
+                out[table] = -1
+    except Exception as e:
+        log.debug(f"get_duckdb_row_counts: {e}")
+    return out
+
+
+def get_writer_health_snapshot() -> dict:
+    """Buffers mémoire (pas encore flush) + lignes DuckDB pour diagnostic."""
+    return {
+        "buffers_pending": get_buffer_stats(),
+        "duckdb_rows": get_duckdb_row_counts(),
+    }
