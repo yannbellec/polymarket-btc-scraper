@@ -4,17 +4,12 @@ Lecture seule depuis R2, aucun impact sur le scraper.
 """
 import os
 import io
-import struct
 from datetime import datetime, timezone, timedelta
 
 import boto3
 import duckdb
 import pandas as pd
 import streamlit as st
-try:
-    import pyarrow.parquet as pq
-except Exception:
-    pq = None
 
 # ─── Config page ────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -228,64 +223,26 @@ def count_rows_full(table: str, date: str) -> int:
     if not keys:
         return 0
 
-    # Fallback si `pyarrow` n'est pas disponible dans l'env du dashboard.
-    if pq is None:
-        con = duckdb.connect()
-        total = 0
-        s3 = get_s3()
-        for key in keys:
-            buf = io.BytesIO()
-            s3.download_fileobj(BUCKET, key, buf)
-            buf.seek(0)
-            tmp = f"/tmp/{key.replace('/', '_')}"
-            with open(tmp, "wb") as f:
-                f.write(buf.read())
-            try:
-                c = con.execute(f"SELECT COUNT(*) AS c FROM read_parquet('{tmp}')").fetchone()[0]
-                total += int(c)
-            except Exception:
-                pass
-        con.close()
-        return total
-
+    con = duckdb.connect()
     total = 0
     s3 = get_s3()
     for key in keys:
-        # 1) Tentative rapide: lire ~1MB de la fin pour extraire num_rows depuis le footer.
-        # 2) Si ça échoue (tail pas assez grande / format inattendu), retomber sur le footer exact via footer_len.
-        MAX_TAIL_BYTES = 1_000_000  # ~1MB
-        fast_tail = None
+        buf = io.BytesIO()
+        s3.download_fileobj(BUCKET, key, buf)
+        buf.seek(0)
+
+        # Même convention que `_read_parquet_keys` pour rester compatible avec l'environnement.
+        tmp = f"/tmp/{key.replace('/', '_')}"
+        with open(tmp, "wb") as f:
+            f.write(buf.read())
+
         try:
-            fast_tail = s3.get_object(Bucket=BUCKET, Key=key, Range=f"bytes=-{MAX_TAIL_BYTES}")["Body"].read()
-            if fast_tail:
-                meta = pq.read_metadata(io.BytesIO(fast_tail))
-                total += int(meta.num_rows)
-                continue
-        except Exception:
-            pass
-
-        # Récupération exacte via footer_len (fondée sur les 8 derniers octets parquet).
-        try:
-            tail8 = s3.get_object(Bucket=BUCKET, Key=key, Range="bytes=-8")["Body"].read()
-            if len(tail8) != 8:
-                continue
-            footer_len = struct.unpack("<i", tail8[:4])[0]
-            if footer_len <= 0 or footer_len > 50_000_000:
-                continue
-
-            exact_tail = s3.get_object(
-                Bucket=BUCKET,
-                Key=key,
-                Range=f"bytes=-{footer_len + 8}",
-            )["Body"].read()
-            if not exact_tail:
-                continue
-
-            meta = pq.read_metadata(io.BytesIO(exact_tail))
-            total += int(meta.num_rows)
+            c = con.execute(f"SELECT COUNT(*) AS c FROM read_parquet('{tmp}')").fetchone()[0]
+            total += int(c)
         except Exception:
             # Si un fichier parquet est corrompu/incompatible, on le skippe comme pour le chargement partiel.
             pass
+    con.close()
     return total
 
 
@@ -354,7 +311,7 @@ with st.sidebar:
 st.markdown(f"## Data Inspector &nbsp;·&nbsp; <span style='color:#38bdf8'>{selected_date}</span>", unsafe_allow_html=True)
 
 # ─── Métriques globales ──────────────────────────────────────────────────────
-with st.spinner("Calcul des métriques globales (metadata only)..."):
+with st.spinner("Calcul des métriques globales (scan counts)..."):
     metrics = {}
     for t in TABLES:
         # Tables lourdes: ne pas se baser sur le preview en RAM, mais compter sur tous les fichiers.
@@ -386,16 +343,6 @@ for i, t in enumerate(TABLES):
 st.markdown("<br>", unsafe_allow_html=True)
 
 # ─── Onglets ────────────────────────────────────────────────────────────────
-st.markdown("---")
-show_explorer = st.checkbox(
-    "Charger l'exploration des données (onglets)",
-    value=False,
-    help="Mode rapide: seules les métriques globales sont affichées. Les onglets peuvent être plus lents."
-)
-if not show_explorer:
-    st.info("Mode rapide activé: affichage uniquement des métriques globales.")
-    st.stop()
-
 tabs = st.tabs(["📋 Marchés", "📊 Orderbook", "💸 Trades", "₿ BTC Chainlink", "₿ BTC Binance", "📸 Snapshots", "🗂 Fichiers R2"])
 
 # ── Tab: btc_markets ────────────────────────────────────────────────────────
