@@ -27,6 +27,10 @@ _subscribed_tokens: set[str] = set()
 _ws_ref = None
 _ws_lock = asyncio.Lock()
 
+# Au-delà de ce seuil, Polymarket cesse d'émettre sans fermer le WS — reconnexion forcée.
+# ~2 tokens × 10 marchés actifs max en même temps.
+MAX_SUBSCRIBED_TOKENS_BEFORE_RECONNECT = 20
+
 _token_to_market: dict[str, str] = {}
 _token_to_outcome: dict[str, str] = {}
 _market_to_expiry: dict[str, int] = {}
@@ -144,6 +148,30 @@ def get_ofi_fields(market_id: str, now_ms: int) -> Dict[str, float]:
     return {"ofi_since_open": since, "ofi_last_60s": last_60}
 
 
+def purge_market_ws_state(market_id: str) -> None:
+    """Retire un marché expiré des mappings WS et des tokens souscrits (évite accumulation)."""
+    tokens = [tid for tid, mid in _token_to_market.items() if mid == market_id]
+    for tid in tokens:
+        _token_to_market.pop(tid, None)
+        _token_to_outcome.pop(tid, None)
+        _subscribed_tokens.discard(tid)
+    _market_to_expiry.pop(market_id, None)
+    _market_to_btc_open.pop(market_id, None)
+    _market_open_ts_ms.pop(market_id, None)
+    _btc_horizon_delta.pop(market_id, None)
+    _last_mid.pop(market_id, None)
+    _last_bid.pop(market_id, None)
+    _last_ask.pop(market_id, None)
+    _trade_count.pop(market_id, None)
+    _volume_cumul.pop(market_id, None)
+    _inter_market_ctx.pop(market_id, None)
+    _ofi_cumul.pop(market_id, None)
+    _ofi_ring.pop(market_id, None)
+    _yes_mid_ring.pop(market_id, None)
+    _spread_ring.pop(market_id, None)
+    _liq_ring.pop(market_id, None)
+
+
 def register_market(market) -> None:
     if market.token_id_yes:
         _token_to_market[market.token_id_yes] = market.market_id
@@ -159,6 +187,7 @@ def register_market(market) -> None:
 
 
 async def subscribe_tokens(token_ids: list[str]) -> None:
+    global _ws_ref
     new_tokens = [t for t in token_ids if t and t not in _subscribed_tokens]
     if not new_tokens:
         return
@@ -168,14 +197,22 @@ async def subscribe_tokens(token_ids: list[str]) -> None:
         if ws is None:
             return
         try:
-            await ws.send(json.dumps({
-                "assets_ids": list(_subscribed_tokens),
-                "type": "market",
-            }))
-            log.info(
-                f"Polymarket WS: souscription etendue (+{len(new_tokens)} tokens, "
-                f"{len(_subscribed_tokens)} au total, sans reconnexion)"
-            )
+            if len(_subscribed_tokens) > MAX_SUBSCRIBED_TOKENS_BEFORE_RECONNECT:
+                await ws.close()
+                _ws_ref = None
+                log.info(
+                    f"Polymarket WS: reconnexion forcee ({len(_subscribed_tokens)} tokens > "
+                    f"{MAX_SUBSCRIBED_TOKENS_BEFORE_RECONNECT})"
+                )
+            else:
+                await ws.send(json.dumps({
+                    "assets_ids": list(_subscribed_tokens),
+                    "type": "market",
+                }))
+                log.info(
+                    f"Polymarket WS: souscription etendue (+{len(new_tokens)} tokens, "
+                    f"{len(_subscribed_tokens)} au total)"
+                )
         except Exception as e:
             log.warning(
                 f"Polymarket WS: envoi souscription sur connexion existante echoue ({e}) — "
