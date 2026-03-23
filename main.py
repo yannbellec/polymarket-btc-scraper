@@ -15,6 +15,7 @@ from scraper.ws_polymarket import (
     subscribe_tokens,
     get_polymarket_ws_health,
     purge_market_ws_state,
+    get_ws_ref,
 )
 from scraper.discoverer import (
     discovery_loop,
@@ -176,6 +177,22 @@ async def status_loop() -> None:
                     f"depuis {int(sc)}s — flux possiblement coupe (voir reconnexion / tokens)"
                 )
 
+async def ws_watchdog_loop() -> None:
+    """Force reconnexion WS si aucune activite depuis 120s."""
+    await asyncio.sleep(60)
+    while True:
+        await asyncio.sleep(30)
+        health = get_polymarket_ws_health()
+        age = health.get("seconds_since_last_activity")
+        if age is not None and age > 120:
+            log.warning(f"WS watchdog: silence depuis {age:.0f}s — reconnexion forcee")
+            alert_error(f"WS watchdog: silence {age:.0f}s")
+            ws = get_ws_ref()
+            if ws is not None:
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
 
 async def run() -> None:
     log.info("=" * 56)
@@ -194,6 +211,10 @@ async def run() -> None:
         asyncio.create_task(restart_on_crash("r2_upload", upload_loop), name="r2_upload"),
         asyncio.create_task(restart_on_crash("expiry_watcher", expiry_watcher_loop), name="expiry_watcher"),
         asyncio.create_task(restart_on_crash("status", status_loop), name="status"),
+        asyncio.create_task(
+            restart_on_crash("ws_watchdog", ws_watchdog_loop),
+            name="ws_watchdog"
+        ),
     ]
 
     log.info(f"  {len(tasks)} coroutines démarrées (restart_on_crash)")

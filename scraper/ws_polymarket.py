@@ -505,6 +505,8 @@ async def _handle_last_trade(event: dict) -> None:
     _trade_count[market_id] = _trade_count.get(market_id, 0) + 1
     _volume_cumul[market_id] = _volume_cumul.get(market_id, 0.0) + size
 
+def get_ws_ref():
+    return _ws_ref
 
 async def polymarket_ws_loop() -> None:
     global _ws_ref
