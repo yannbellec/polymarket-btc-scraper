@@ -303,9 +303,9 @@ with tabs[1]:
 
         # Formatage ts
         if "captured_ts_ms" in df_show.columns:
-            df_show["time"] = df_show["captured_ts_ms"].apply(fmt_ts)
+            df_show.insert(0, "heure", df_show["captured_ts_ms"].apply(fmt_ts))
 
-        priority = ["time", "market_id", "yes_mid", "yes_spread", "book_imbalance",
+        priority = ["heure", "market_id", "yes_mid", "yes_spread", "book_imbalance",
                     "yes_best_bid", "yes_best_ask", "yes_total_bid_liq", "yes_total_ask_liq",
                     "yes_book_depth", "btc_spot", "moneyness", "time_to_expiry_ms",
                     "ofi_since_open", "ofi_last_60s", "yes_spread_ma_60", "yes_liq_ma_60",
@@ -345,9 +345,9 @@ with tabs[2]:
             df_show = df_show[df_show["side"] == sel_side]
 
         if "trade_ts_ms" in df_show.columns:
-            df_show["time"] = df_show["trade_ts_ms"].apply(fmt_ts)
+            df_show.insert(0, "heure", df_show["trade_ts_ms"].apply(fmt_ts))
 
-        priority = ["time", "market_id", "outcome", "price", "size", "side",
+        priority = ["heure", "market_id", "outcome", "price", "size", "side",
                     "slippage_vs_mid", "yes_best_bid_at_trade", "yes_best_ask_at_trade",
                     "btc_spot_at_trade", "moneyness_at_trade", "time_to_expiry_at_trade_ms",
                     "btc_delta_1min", "btc_delta_2min", "btc_delta_3min"]
@@ -385,10 +385,11 @@ with tabs[3]:
                       delta_color="normal" if coverage > 95 else "inverse")
 
         n_rows = st.slider("Nb lignes", 100, min(5000, len(df)), 500, key="btc_rows")
-        if "ts_ms" in df.columns:
-            df["time"] = df["ts_ms"].apply(fmt_ts)
-        cols_show = ["time"] + [c for c in df.columns if c != "ts_ms"]
-        st.dataframe(df[cols_show].tail(n_rows), use_container_width=True, height=500)
+        df_show = df.copy()
+        if "ts_ms" in df_show.columns:
+            df_show.insert(0, "heure", df_show["ts_ms"].apply(fmt_ts))
+            df_show = df_show.drop(columns=["ts_ms"])
+        st.dataframe(df_show.tail(n_rows), use_container_width=True, height=500)
 
 # ── Tab: btc_spot_ticks_binance ──────────────────────────────────────────────
 with tabs[4]:
@@ -398,10 +399,11 @@ with tabs[4]:
     else:
         st.markdown(f"**{len(df):,} ticks Binance** &nbsp;·&nbsp; colonnes: `{len(df.columns)}`")
         n_rows = st.slider("Nb lignes", 100, min(5000, len(df)), 500, key="bn_rows")
-        if "ts_ms" in df.columns:
-            df["time"] = df["ts_ms"].apply(fmt_ts)
-        cols_show = ["time"] + [c for c in df.columns if c != "ts_ms"]
-        st.dataframe(df[cols_show].tail(n_rows), use_container_width=True, height=500)
+        df_show = df.copy()
+        if "ts_ms" in df_show.columns:
+            df_show.insert(0, "heure", df_show["ts_ms"].apply(fmt_ts))
+            df_show = df_show.drop(columns=["ts_ms"])
+        st.dataframe(df_show.tail(n_rows), use_container_width=True, height=500)
 
 # ── Tab: market_snapshots ────────────────────────────────────────────────────
 with tabs[5]:
@@ -419,9 +421,9 @@ with tabs[5]:
             )
 
         if "snapshot_ts_ms" in df.columns:
-            df["time"] = df["snapshot_ts_ms"].apply(fmt_ts)
+            df.insert(0, "heure", df["snapshot_ts_ms"].apply(fmt_ts))
 
-        priority = ["time", "market_id", "status", "winning_outcome",
+        priority = ["heure", "market_id", "status", "winning_outcome",
                     "total_ticks", "total_trades", "total_volume_usdc",
                     "open_price_yes", "close_price_yes", "min_price_yes", "max_price_yes",
                     "price_at_1min", "price_at_30s",
